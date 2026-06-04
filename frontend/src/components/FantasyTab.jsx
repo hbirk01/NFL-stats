@@ -267,7 +267,12 @@ function ValuePicksView({ onSelect }) {
                   </div>
                 </div>
                 <div style={{ fontSize: 11, color: 'var(--muted)' }}>
-                  {p.ppg != null ? <><b style={{ color: 'var(--text)' }}>{p.ppg.toFixed(1)}</b> PPG</> : '—'}
+                  {p.weighted_ppg != null
+                    ? <><b style={{ color: 'var(--text)' }}>{p.weighted_ppg.toFixed(1)}</b> wPPG</>
+                    : p.ppg != null ? <><b style={{ color: 'var(--text)' }}>{p.ppg.toFixed(1)}</b> PPG</> : '—'}
+                  {p.ppg != null && p.weighted_ppg != null && (
+                    <span style={{ marginLeft: 6, color: 'var(--muted)' }}>({p.ppg.toFixed(1)} raw)</span>
+                  )}
                   {p.games != null && (
                     <span style={{ marginLeft: 6, color: p.games < 8 ? 'var(--red)' : 'var(--muted)' }}>
                       · <b style={{ color: p.games < 8 ? 'var(--red)' : 'var(--text)' }}>{p.games}</b>G

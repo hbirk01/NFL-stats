@@ -1143,6 +1143,8 @@ def get_value_picks():
         # and short-season contributors (<8 games) to keep the pool meaningful
         if ppg is None or games < 8 or entry.get("overall_adp", 999) > 250:
             continue
+        # Weighted PPG = PPG × (games played / 17) — rewards both efficiency and availability
+        weighted_ppg = round(ppg * (games / 17), 2)
         team = TEAM_FIX.get(entry["team"], entry["team"])
         by_pos[entry["position"]].append({
             "player_id": pid,
@@ -1153,12 +1155,14 @@ def get_value_picks():
             "overall_adp": entry["overall_adp"],
             "ppg": ppg,
             "games": games,
+            "weighted_ppg": weighted_ppg,
         })
 
     results = []
     for pos, group in by_pos.items():
-        sorted_by_ppg = sorted(group, key=lambda x: x["ppg"], reverse=True)
-        for perf_rank, player in enumerate(sorted_by_ppg, 1):
+        # Rank by weighted PPG (PPG × games/17) so availability is factored in
+        sorted_by_perf = sorted(group, key=lambda x: x["weighted_ppg"], reverse=True)
+        for perf_rank, player in enumerate(sorted_by_perf, 1):
             adp_rank = player["redraft_pos_rank"]
             raw_value = adp_rank - perf_rank
             player["performance_rank"] = perf_rank
