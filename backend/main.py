@@ -1037,6 +1037,122 @@ def get_dynasty_adp():
     return _dynasty_cache["data"]
 
 
+_redraft_cache: dict = {}
+
+@app.get("/api/redraft-adp")
+def get_redraft_adp():
+    """Redraft rankings from FantasyCalc (overall rank, position rank, value)."""
+    import time
+    import httpx
+
+    if _redraft_cache.get("data") and time.time() - _redraft_cache.get("ts", 0) < 86400:
+        return _redraft_cache["data"]
+
+    try:
+        url = "https://api.fantasycalc.com/values/current?isDynasty=false&numQbs=1"
+        resp = httpx.get(url, timeout=10, headers={"User-Agent": "GridIron/1.0"})
+        resp.raise_for_status()
+        fc_data = resp.json()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"FantasyCalc unavailable: {e}")
+
+    data = load_data()
+    players_df = data["players"]
+
+    def norm_name(n):
+        return n.lower().replace("'", "").replace(".", "").replace("-", "").replace(" ", "") if n else ""
+
+    name_map = {norm_name(r["player_display_name"]): r["player_id"]
+                for _, r in players_df.iterrows() if r.get("player_display_name")}
+
+    TEAM_FIX = {"LAR": "LA", "JAC": "JAX", "LVR": "LV"}
+
+    results = []
+    for entry in fc_data:
+        p = entry["player"]
+        fc_name = norm_name(p.get("name", ""))
+        pid = name_map.get(fc_name)
+        team = TEAM_FIX.get(p.get("maybeTeam", ""), p.get("maybeTeam", ""))
+        results.append({
+            "player_id": pid,
+            "name": p.get("name"),
+            "position": p.get("position"),
+            "team": team,
+            "redraft_rank": entry.get("overallRank"),
+            "redraft_pos_rank": entry.get("positionRank"),
+            "redraft_value": entry.get("value"),
+            "age": p.get("maybeAge"),
+        })
+
+    _redraft_cache["data"] = {"players": results, "count": len(results)}
+    _redraft_cache["ts"] = time.time()
+    return _redraft_cache["data"]
+
+
+@app.get("/api/value-picks")
+def get_value_picks():
+    """
+    Value picks: players who overperformed their redraft positional ADP in 2025.
+    Uses redraft ADP (not dynasty) for a fair like-for-like comparison.
+    """
+    import math
+
+    redraft_data = get_redraft_adp()
+    perf_data = load_data()
+    players_df = perf_data["players"]
+
+    ppg_map = {}
+    games_map = {}
+    for _, r in players_df.iterrows():
+        pid = r["player_id"]
+        games = r.get("games") or 0
+        fpts = r.get("fantasy_points_ppr")
+        games_map[pid] = games
+        if fpts is not None and games > 0:
+            ppg_map[pid] = round(float(fpts) / float(games), 2)
+
+    VALID = {"QB", "WR", "RB", "TE"}
+    entries = [d for d in redraft_data["players"] if d.get("position") in VALID and d.get("redraft_pos_rank") and d.get("player_id")]
+
+    from collections import defaultdict
+    by_pos = defaultdict(list)
+    for e in entries:
+        ppg = ppg_map.get(e["player_id"])
+        games = games_map.get(e["player_id"], 0)
+        if ppg is None or games < 4:
+            continue
+        by_pos[e["position"]].append({**e, "ppg": ppg, "games": games})
+
+    results = []
+    for pos, group in by_pos.items():
+        sorted_by_ppg = sorted(group, key=lambda x: x["ppg"], reverse=True)
+        for perf_rank, player in enumerate(sorted_by_ppg, 1):
+            adp_rank = player["redraft_pos_rank"]
+            raw_value = adp_rank - perf_rank
+            player["performance_rank"] = perf_rank
+            player["raw_value"] = raw_value
+            results.append(player)
+
+    for pos in VALID:
+        pos_players = [r for r in results if r["position"] == pos]
+        if not pos_players:
+            continue
+        vals = [r["raw_value"] for r in pos_players]
+        mean = sum(vals) / len(vals)
+        std = math.sqrt(sum((v - mean) ** 2 for v in vals) / len(vals)) or 1
+        for r in pos_players:
+            z = (r["raw_value"] - mean) / std
+            r["value_score"] = round(min(100, max(0, 50 + z * 15)), 1)
+
+    results.sort(key=lambda x: x.get("value_score", 0), reverse=True)
+
+    headshot_map = {r["player_id"]: r.get("headshot_url") for _, r in players_df.iterrows()}
+    for r in results:
+        r["headshot_url"] = headshot_map.get(r["player_id"])
+
+    return {"picks": results[:50]}
+
+
 @app.get("/api/dynasty-value-picks")
 def get_dynasty_value_picks():
     """
