@@ -30,10 +30,13 @@ function trendBadge(trend) {
   )
 }
 
+const PPG_THRESHOLD = { QB: 13, WR: 9, RB: 7, TE: 7, ALL: 8 }
+
 function ValuePicksView({ onSelect }) {
   const [picks, setPicks] = useState([])
   const [loading, setLoading] = useState(true)
   const [pos, setPos] = useState('ALL')
+  const [startersOnly, setStartersOnly] = useState(false)
 
   useEffect(() => {
     fetch('/api/dynasty-value-picks')
@@ -42,7 +45,9 @@ function ValuePicksView({ onSelect }) {
       .catch(() => setLoading(false))
   }, [])
 
-  const filtered = pos === 'ALL' ? picks : picks.filter(p => p.position === pos)
+  const filtered = picks
+    .filter(p => pos === 'ALL' || p.position === pos)
+    .filter(p => !startersOnly || (p.ppg != null && p.ppg >= (PPG_THRESHOLD[p.position] ?? 10)))
 
   if (loading) return <div className="spinner" />
 
@@ -58,6 +63,23 @@ function ValuePicksView({ onSelect }) {
         {POSITIONS.map(p => (
           <button key={p} className={`filter-btn pos-${p} ${pos === p ? 'active' : ''}`} onClick={() => setPos(p)}>{p}</button>
         ))}
+        <button
+          onClick={() => setStartersOnly(s => !s)}
+          style={{
+            marginLeft: 8,
+            padding: '4px 10px',
+            borderRadius: 6,
+            border: `1px solid ${startersOnly ? 'var(--accent)' : 'var(--border)'}`,
+            background: startersOnly ? 'var(--accent)22' : 'transparent',
+            color: startersOnly ? 'var(--accent)' : 'var(--muted)',
+            fontSize: 11,
+            fontWeight: 700,
+            cursor: 'pointer',
+            whiteSpace: 'nowrap',
+          }}
+        >
+          ⚡ Starters Only
+        </button>
         <span style={{ color: 'var(--muted)', fontSize: 12, marginLeft: 'auto' }}>{filtered.length} players</span>
       </div>
 
