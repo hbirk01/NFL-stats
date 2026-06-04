@@ -1,52 +1,52 @@
 {
   "ridge": {
-    "cv_spearman_avg": 0.5787,
+    "cv_spearman_avg": 0.5773,
     "cv_folds": [
       {
         "season": 2021,
-        "spearman": 0.6153
+        "spearman": 0.613
       },
       {
         "season": 2022,
-        "spearman": 0.6147
+        "spearman": 0.6103
       },
       {
         "season": 2023,
-        "spearman": 0.5361
+        "spearman": 0.5346
       },
       {
         "season": 2024,
-        "spearman": 0.5435
+        "spearman": 0.5442
       },
       {
         "season": 2025,
-        "spearman": 0.5838
+        "spearman": 0.5844
       }
     ],
     "best_alpha": 50.0
   },
   "random_forest": {
-    "cv_spearman_avg": 0.5785,
+    "cv_spearman_avg": 0.5779,
     "cv_folds": [
       {
         "season": 2021,
-        "spearman": 0.5952
+        "spearman": 0.5916
       },
       {
         "season": 2022,
-        "spearman": 0.5992
+        "spearman": 0.598
       },
       {
         "season": 2023,
-        "spearman": 0.532
+        "spearman": 0.5329
       },
       {
         "season": 2024,
-        "spearman": 0.5645
+        "spearman": 0.5656
       },
       {
         "season": 2025,
-        "spearman": 0.6017
+        "spearman": 0.6015
       }
     ],
     "best_params": {
@@ -56,34 +56,34 @@
     }
   },
   "xgboost": {
-    "cv_spearman_avg": 0.541,
+    "cv_spearman_avg": 0.5412,
     "cv_folds": [
       {
         "season": 2021,
-        "spearman": 0.5552
+        "spearman": 0.5535
       },
       {
         "season": 2022,
-        "spearman": 0.5333
+        "spearman": 0.5352
       },
       {
         "season": 2023,
-        "spearman": 0.5008
+        "spearman": 0.4954
       },
       {
         "season": 2024,
-        "spearman": 0.528
+        "spearman": 0.5351
       },
       {
         "season": 2025,
-        "spearman": 0.5875
+        "spearman": 0.5866
       }
     ],
     "best_params": {
       "lr": 0.05,
       "max_depth": 3,
       "n_est": 100,
-      "subsample": 1.0
+      "subsample": 0.7
     }
   }
 }

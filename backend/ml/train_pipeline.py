@@ -607,6 +607,19 @@ def _load_ngs_snaps(year: int):
     return ngs_recv, ngs_rush, ngs_pass, snaps
 
 
+def build_competition_lookup(adp_players: list) -> dict:
+    """
+    Returns dict: (team, position) → sorted list of pos_adp_ranks in that room.
+    Used to compute how crowded a backfield/WR corps is relative to each player's ADP.
+    """
+    from collections import defaultdict
+    room = defaultdict(list)
+    for p in adp_players:
+        key = (p.get("team", ""), p.get("position", ""))
+        room[key].append(p.get("pos_adp_rank", 999))
+    return {k: sorted(v) for k, v in room.items()}
+
+
 def build_feature_matrix(years_data: dict) -> pd.DataFrame:
     """
     Build the full feature matrix. For each player-season Y:
@@ -635,6 +648,9 @@ def build_feature_matrix(years_data: dict) -> pd.DataFrame:
         current = years_data[year]
         if current.empty:
             continue
+
+        # Build competition lookup for this season's ADP pool
+        comp_lookup = build_competition_lookup(current.to_dict("records"))
 
         prev_year = year - 1
         prev2_year = year - 2
@@ -798,6 +814,19 @@ def build_feature_matrix(years_data: dict) -> pd.DataFrame:
             weight      = dc.get("weight", np.nan)
             height_in   = dc.get("height_in", np.nan)
 
+            # Position competition on same team
+            current_team = row.get("team", "")
+            current_pos_rank = row.get("pos_adp_rank", 999)
+            room_ranks = comp_lookup.get((current_team, pos), [current_pos_rank])
+            # Best teammate rank = lowest pos_adp_rank among same team/position, excluding self
+            teammate_ranks = [r for r in room_ranks if r != current_pos_rank]
+            best_teammate_rank = min(teammate_ranks) if teammate_ranks else 999
+            # Positive = I'm behind a teammate (they have lower/better pos rank)
+            # Negative = I'm the clear starter (no better-ranked teammate)
+            adp_gap_to_teammate = current_pos_rank - best_teammate_rank
+            is_top_dog = int(best_teammate_rank > current_pos_rank or not teammate_ranks)
+            num_pos_teammates = len(teammate_ranks)
+
             feature_rows.append({
                 "season": year,
                 "name": row.get("name", ""),
@@ -851,6 +880,10 @@ def build_feature_matrix(years_data: dict) -> pd.DataFrame:
                 "age_sq": age_sq,
                 "targets_per_game_prev": targets_per_game_prev,
                 "carries_per_game_prev": carries_per_game_prev,
+                # Position competition
+                "adp_gap_to_teammate": adp_gap_to_teammate,
+                "is_top_dog": is_top_dog,
+                "num_pos_teammates": num_pos_teammates,
                 # Draft capital + combine athleticism
                 "draft_round": draft_round,
                 "draft_pick_norm": draft_pick_norm,
@@ -892,6 +925,8 @@ FEATURE_COLS = [
     "cpoe_prev", "aggressiveness_prev", "qb_air_yards_prev",
     # New: snaps + derived
     "snap_pct_prev", "age_sq", "targets_per_game_prev", "carries_per_game_prev",
+    # Position competition
+    "adp_gap_to_teammate", "is_top_dog", "num_pos_teammates",
     # Draft capital + combine athleticism
     "draft_round", "draft_pick_norm", "is_undrafted",
     "forty", "vertical", "broad_jump", "cone", "weight", "height_in",
@@ -1206,6 +1241,9 @@ def generate_2026_predictions(models, fm, years_data):
     print("  [Draft/Combine 2026] Building lookup...")
     draft_combine_2026 = build_draft_combine_lookup(list(range(2015, 2027)))
 
+    # Build 2026 competition lookup from the ADP pool
+    comp_2026 = build_competition_lookup(list(adp_2026.values()))
+
     rows = []
     for name_n, adp_entry in adp_2026.items():
         pos = adp_entry.get("position", "")
@@ -1329,6 +1367,16 @@ def generate_2026_predictions(models, fm, years_data):
         weight         = dc.get("weight", np.nan)
         height_in      = dc.get("height_in", np.nan)
 
+        # Position competition
+        current_team = adp_entry.get("team", "")
+        current_pos_rank = adp_entry.get("pos_adp_rank", 999)
+        room_ranks = comp_2026.get((current_team, pos), [current_pos_rank])
+        teammate_ranks = [r for r in room_ranks if r != current_pos_rank]
+        best_teammate_rank = min(teammate_ranks) if teammate_ranks else 999
+        adp_gap_to_teammate = current_pos_rank - best_teammate_rank
+        is_top_dog = int(best_teammate_rank > current_pos_rank or not teammate_ranks)
+        num_pos_teammates = len(teammate_ranks)
+
         rows.append({
             "name_norm": name_n,
             "name": adp_entry.get("name", ""),
@@ -1375,6 +1423,10 @@ def generate_2026_predictions(models, fm, years_data):
             "age_sq": age_sq,
             "targets_per_game_prev": targets_per_game_prev,
             "carries_per_game_prev": carries_per_game_prev,
+            # Position competition
+            "adp_gap_to_teammate": adp_gap_to_teammate,
+            "is_top_dog": is_top_dog,
+            "num_pos_teammates": num_pos_teammates,
             # Draft capital + combine
             "draft_round": draft_round,
             "draft_pick_norm": draft_pick_norm,
@@ -1431,6 +1483,9 @@ def generate_2026_predictions(models, fm, years_data):
             "prior_games": int(row["games_prev"]),
             "is_rookie": bool(row["is_rookie"]),
             "age": float(row["age"]),
+            "adp_gap_to_teammate": int(row.get("adp_gap_to_teammate", 0)) if pd.notna(row.get("adp_gap_to_teammate")) else 0,
+            "is_top_dog": bool(row.get("is_top_dog", 1)),
+            "num_pos_teammates": int(row.get("num_pos_teammates", 0)),
             "draft_round": int(row.get("draft_round", 8)) if not pd.isna(row.get("draft_round", 8)) else 8,
             "draft_pick_norm": round(float(row.get("draft_pick_norm", 0)), 3),
             "is_undrafted": bool(row.get("is_undrafted", 1)),
