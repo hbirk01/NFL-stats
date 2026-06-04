@@ -1092,36 +1092,68 @@ def get_redraft_adp():
 @app.get("/api/value-picks")
 def get_value_picks():
     """
-    Value picks: players who overperformed their redraft positional ADP in 2025.
-    Uses redraft ADP (not dynasty) for a fair like-for-like comparison.
+    Value picks: players who overperformed their pre-season redraft ADP in 2025.
+    Uses a static pre-season ADP snapshot (FantasyPros PPR, scraped ~Sep 1 2025)
+    so post-season repricing doesn't contaminate the signal.
     """
-    import math
+    import math, os, json as _json
 
-    redraft_data = get_redraft_adp()
+    # Load pre-season ADP snapshot (static file, not live API)
+    adp_file = os.path.join(os.path.dirname(__file__), "data_2025_preseason_adp.json")
+    with open(adp_file) as f:
+        adp_snapshot = _json.load(f)
+
     perf_data = load_data()
     players_df = perf_data["players"]
 
+    # Name normalisation for fuzzy matching
+    def norm(n):
+        return (n or "").lower().replace("'", "").replace(".", "").replace("-", "").replace(" ", "")
+
+    name_to_pid = {norm(r["player_display_name"]): r["player_id"]
+                   for _, r in players_df.iterrows() if r.get("player_display_name")}
+    headshot_map = {r["player_id"]: r.get("headshot_url") for _, r in players_df.iterrows()}
+
     ppg_map = {}
     games_map = {}
+    team_map = {}
     for _, r in players_df.iterrows():
         pid = r["player_id"]
         games = r.get("games") or 0
         fpts = r.get("fantasy_points_ppr")
         games_map[pid] = games
+        team_map[pid] = r.get("recent_team", "")
         if fpts is not None and games > 0:
             ppg_map[pid] = round(float(fpts) / float(games), 2)
 
     VALID = {"QB", "WR", "RB", "TE"}
-    entries = [d for d in redraft_data["players"] if d.get("position") in VALID and d.get("redraft_pos_rank") and d.get("player_id")]
+    TEAM_FIX = {"LAR": "LA", "JAC": "JAX", "LVR": "LV"}
 
     from collections import defaultdict
     by_pos = defaultdict(list)
-    for e in entries:
-        ppg = ppg_map.get(e["player_id"])
-        games = games_map.get(e["player_id"], 0)
-        if ppg is None or games < 4:
+    for entry in adp_snapshot["players"]:
+        if entry["position"] not in VALID:
             continue
-        by_pos[e["position"]].append({**e, "ppg": ppg, "games": games})
+        pid = name_to_pid.get(norm(entry["name"]))
+        if not pid:
+            continue
+        ppg = ppg_map.get(pid)
+        games = games_map.get(pid, 0)
+        # Exclude players who were essentially undrafted (overall ADP > 250 ≈ ~20 rounds)
+        # and short-season contributors (<8 games) to keep the pool meaningful
+        if ppg is None or games < 8 or entry.get("overall_adp", 999) > 250:
+            continue
+        team = TEAM_FIX.get(entry["team"], entry["team"])
+        by_pos[entry["position"]].append({
+            "player_id": pid,
+            "name": entry["name"],
+            "position": entry["position"],
+            "team": team,
+            "redraft_pos_rank": entry["pos_adp_rank"],
+            "overall_adp": entry["overall_adp"],
+            "ppg": ppg,
+            "games": games,
+        })
 
     results = []
     for pos, group in by_pos.items():
