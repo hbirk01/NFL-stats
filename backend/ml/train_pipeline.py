@@ -61,6 +61,94 @@ TEAM_FIX = {"LAR": "LA", "JAC": "JAX", "LVR": "LV"}
 
 norm = lambda n: (n or "").lower().replace("'", "").replace(".", "").replace("-", "").replace(" ", "")
 
+
+def build_draft_combine_lookup(years: list[int]) -> dict:
+    """
+    Build a lookup dict: gsis_id → draft/combine features.
+    Covers all players drafted in the given years.
+
+    Draft capital features:
+      - draft_round (1-7, 8 = undrafted)
+      - draft_pick  (1-262, 300 = undrafted)
+
+    Combine athleticism features (NaN if not measured):
+      - forty, vertical, broad_jump, cone, shuttle, height_in, weight
+
+    NOTE: college production stats (yards, dominator rating, etc.) require
+    the College Football Data API (collegefootballdata.com) which is a
+    separate integration — not included here.
+    """
+    import nfl_data_py as nfl
+
+    draft_frames = []
+    combine_frames = []
+
+    for year in years:
+        try:
+            dp = nfl.import_draft_picks([year])
+            dp = dp[dp["position"].isin(["QB", "WR", "RB", "TE"])].copy()
+            dp = dp[dp["gsis_id"].notna()].copy()
+            dp["gsis_id"] = dp["gsis_id"].astype(str)
+            dp["draft_round_val"] = dp["round"].fillna(8).astype(int)
+            dp["draft_pick_val"] = dp["pick"].fillna(300).astype(int)
+            draft_frames.append(dp[["gsis_id", "pfr_player_id", "draft_round_val", "draft_pick_val", "pfr_player_name"]])
+        except Exception:
+            pass
+        try:
+            cb = nfl.import_combine_data([year])
+            cb = cb[cb["pos"].isin(["QB", "WR", "RB", "TE"])].copy()
+            cb = cb[cb["pfr_id"].notna()].copy()
+
+            def _ht_to_inches(h):
+                """Convert height string '6-2' to inches, or return NaN."""
+                try:
+                    if isinstance(h, str) and "-" in h:
+                        ft, inch = h.split("-")
+                        return int(ft) * 12 + int(inch)
+                    return float(h) if h else np.nan
+                except Exception:
+                    return np.nan
+
+            cb["height_in"] = cb["ht"].apply(_ht_to_inches)
+            combine_frames.append(cb[["pfr_id", "forty", "vertical", "broad_jump", "cone", "shuttle", "height_in", "wt"]])
+        except Exception:
+            pass
+
+    if not draft_frames:
+        return {}
+
+    all_draft = pd.concat(draft_frames, ignore_index=True).drop_duplicates("gsis_id")
+    all_combine = pd.concat(combine_frames, ignore_index=True).drop_duplicates("pfr_id") if combine_frames else pd.DataFrame()
+
+    # Join combine onto draft via pfr_player_id
+    if not all_combine.empty:
+        merged = all_draft.merge(all_combine, left_on="pfr_player_id", right_on="pfr_id", how="left")
+    else:
+        merged = all_draft.copy()
+        for col in ["forty", "vertical", "broad_jump", "cone", "shuttle", "height_in", "wt"]:
+            merged[col] = np.nan
+
+    lookup = {}
+    for _, row in merged.iterrows():
+        gsis = row["gsis_id"]
+        lookup[gsis] = {
+            "draft_round": int(row.get("draft_round_val", 8)),
+            "draft_pick": int(row.get("draft_pick_val", 300)),
+            "forty": row.get("forty", np.nan),
+            "vertical": row.get("vertical", np.nan),
+            "broad_jump": row.get("broad_jump", np.nan),
+            "cone": row.get("cone", np.nan),
+            "shuttle": row.get("shuttle", np.nan),
+            "height_in": row.get("height_in", np.nan),
+            "weight": row.get("wt", np.nan),
+        }
+        # Also index by name for fallback
+        name_key = norm(row.get("pfr_player_name", ""))
+        if name_key:
+            lookup[f"name:{name_key}"] = lookup[gsis]
+
+    return lookup
+
 SEASON_GAMES = {
     2020: 16,
     2021: 17,
@@ -534,6 +622,13 @@ def build_feature_matrix(years_data: dict) -> pd.DataFrame:
         if prev_y not in ngs_cache:
             ngs_cache[prev_y] = _load_ngs_snaps(prev_y)
 
+    # Build draft capital + combine lookup (all draft years we might need)
+    all_years = sorted(years_data.keys())
+    draft_years = list(range(min(all_years) - 5, max(all_years) + 2))
+    print(f"  [Draft/Combine] Building lookup for draft years {draft_years[0]}-{draft_years[-1]}...")
+    draft_combine = build_draft_combine_lookup(draft_years)
+    print(f"  [Draft/Combine] {len([k for k in draft_combine if not str(k).startswith('name:')])} players indexed")
+
     for year in sorted(years_data.keys()):
         if year not in years_data:
             continue
@@ -688,6 +783,21 @@ def build_feature_matrix(years_data: dict) -> pd.DataFrame:
             snap_row = snaps.get(name_n)
             snap_pct_prev = _get(snap_row, "offense_pct", 0)
 
+            # Draft capital + combine athleticism
+            # Look up by gsis_id first, then fall back to name
+            dc = draft_combine.get(player_id) or draft_combine.get(f"name:{name_n}", {})
+            draft_round = dc.get("draft_round", 8)       # 8 = undrafted
+            draft_pick  = dc.get("draft_pick", 300)      # 300 = undrafted
+            is_undrafted = int(draft_round == 8)
+            # Normalise pick to 0-1 range (pick 1 = 1.0, pick 300 = 0.0)
+            draft_pick_norm = max(0.0, 1.0 - (draft_pick - 1) / 299)
+            forty       = dc.get("forty", np.nan)
+            vertical    = dc.get("vertical", np.nan)
+            broad_jump  = dc.get("broad_jump", np.nan)
+            cone        = dc.get("cone", np.nan)
+            weight      = dc.get("weight", np.nan)
+            height_in   = dc.get("height_in", np.nan)
+
             feature_rows.append({
                 "season": year,
                 "name": row.get("name", ""),
@@ -741,6 +851,16 @@ def build_feature_matrix(years_data: dict) -> pd.DataFrame:
                 "age_sq": age_sq,
                 "targets_per_game_prev": targets_per_game_prev,
                 "carries_per_game_prev": carries_per_game_prev,
+                # Draft capital + combine athleticism
+                "draft_round": draft_round,
+                "draft_pick_norm": draft_pick_norm,
+                "is_undrafted": is_undrafted,
+                "forty": forty,
+                "vertical": vertical,
+                "broad_jump": broad_jump,
+                "cone": cone,
+                "weight": weight,
+                "height_in": height_in,
                 # Target
                 "value_score": row.get("value_score", np.nan),
                 # For prediction output
@@ -772,6 +892,9 @@ FEATURE_COLS = [
     "cpoe_prev", "aggressiveness_prev", "qb_air_yards_prev",
     # New: snaps + derived
     "snap_pct_prev", "age_sq", "targets_per_game_prev", "carries_per_game_prev",
+    # Draft capital + combine athleticism
+    "draft_round", "draft_pick_norm", "is_undrafted",
+    "forty", "vertical", "broad_jump", "cone", "weight", "height_in",
 ]
 
 
@@ -1079,6 +1202,10 @@ def generate_2026_predictions(models, fm, years_data):
     # Load NGS + snap data for 2025 (prior year for 2026 predictions)
     ngs_recv_2025, ngs_rush_2025, ngs_pass_2025, snaps_2025 = _load_ngs_snaps(2025)
 
+    # Draft capital + combine for 2026 rookies (draft class 2026) and any veteran lookups
+    print("  [Draft/Combine 2026] Building lookup...")
+    draft_combine_2026 = build_draft_combine_lookup(list(range(2015, 2027)))
+
     rows = []
     for name_n, adp_entry in adp_2026.items():
         pos = adp_entry.get("position", "")
@@ -1189,6 +1316,19 @@ def generate_2026_predictions(models, fm, years_data):
         snap_row = snaps_2025.get(name_n)
         snap_pct_prev = _get(snap_row, "offense_pct", 0)
 
+        # Draft capital + combine
+        dc = draft_combine_2026.get(player_id) or draft_combine_2026.get(f"name:{name_n}", {})
+        draft_round    = dc.get("draft_round", 8)
+        draft_pick     = dc.get("draft_pick", 300)
+        is_undrafted   = int(draft_round == 8)
+        draft_pick_norm = max(0.0, 1.0 - (draft_pick - 1) / 299)
+        forty          = dc.get("forty", np.nan)
+        vertical       = dc.get("vertical", np.nan)
+        broad_jump     = dc.get("broad_jump", np.nan)
+        cone           = dc.get("cone", np.nan)
+        weight         = dc.get("weight", np.nan)
+        height_in      = dc.get("height_in", np.nan)
+
         rows.append({
             "name_norm": name_n,
             "name": adp_entry.get("name", ""),
@@ -1235,6 +1375,16 @@ def generate_2026_predictions(models, fm, years_data):
             "age_sq": age_sq,
             "targets_per_game_prev": targets_per_game_prev,
             "carries_per_game_prev": carries_per_game_prev,
+            # Draft capital + combine
+            "draft_round": draft_round,
+            "draft_pick_norm": draft_pick_norm,
+            "is_undrafted": is_undrafted,
+            "forty": forty,
+            "vertical": vertical,
+            "broad_jump": broad_jump,
+            "cone": cone,
+            "weight": weight,
+            "height_in": height_in,
         })
 
     if not rows:
@@ -1281,6 +1431,12 @@ def generate_2026_predictions(models, fm, years_data):
             "prior_games": int(row["games_prev"]),
             "is_rookie": bool(row["is_rookie"]),
             "age": float(row["age"]),
+            "draft_round": int(row.get("draft_round", 8)) if not pd.isna(row.get("draft_round", 8)) else 8,
+            "draft_pick_norm": round(float(row.get("draft_pick_norm", 0)), 3),
+            "is_undrafted": bool(row.get("is_undrafted", 1)),
+            "forty": round(float(row["forty"]), 2) if pd.notna(row.get("forty")) else None,
+            "vertical": round(float(row["vertical"]), 1) if pd.notna(row.get("vertical")) else None,
+            "broad_jump": round(float(row["broad_jump"]), 0) if pd.notna(row.get("broad_jump")) else None,
             "ridge_pred": round(float(row["ridge_pred"]), 2),
             "rf_pred": round(float(row["rf_pred"]), 2),
             "xgb_pred": round(float(row["xgb_pred"]), 2),
