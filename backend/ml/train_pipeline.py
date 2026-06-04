@@ -247,6 +247,114 @@ def _stats_from_pbp(year: int) -> pd.DataFrame:
     return df
 
 
+def fetch_ngs_snap_data(year: int) -> None:
+    """Fetch and save NGS (receiving/rushing/passing) and snap count data for a year."""
+    import nfl_data_py as nfl
+
+    # NGS Receiving
+    recv_path = BACKEND / f"data_{year}_ngs_receiving.parquet"
+    if not recv_path.exists():
+        print(f"  [NGS Receiving {year}] Fetching...")
+        try:
+            df = nfl.import_ngs_data("receiving", [year])
+            if not df.empty:
+                df = df[df.get("season_type", pd.Series(["REG"] * len(df))).eq("REG")] if "season_type" in df.columns else df
+                # Season-level: either week==None or a specific season-total row
+                season_df = df[df["week"].isna()] if "week" in df.columns else df
+                if season_df.empty:
+                    # Some years use week==0 or the last week for season totals — try mean
+                    season_df = df.groupby("player_gsis_id", as_index=False).mean(numeric_only=True)
+                    if "player_display_name" in df.columns:
+                        name_map = df.drop_duplicates("player_gsis_id")[["player_gsis_id", "player_display_name"]]
+                        season_df = season_df.merge(name_map, on="player_gsis_id", how="left")
+                if "player_display_name" in season_df.columns:
+                    season_df["name_norm"] = season_df["player_display_name"].apply(norm)
+                season_df.to_parquet(recv_path, index=False)
+                print(f"  [NGS Receiving {year}] Saved {len(season_df)} rows.")
+            else:
+                print(f"  [NGS Receiving {year}] Empty.")
+        except Exception as e:
+            print(f"  [NGS Receiving {year}] Error: {e}")
+    else:
+        print(f"  [NGS Receiving {year}] Already exists.")
+
+    # NGS Rushing
+    rush_path = BACKEND / f"data_{year}_ngs_rushing.parquet"
+    if not rush_path.exists():
+        print(f"  [NGS Rushing {year}] Fetching...")
+        try:
+            df = nfl.import_ngs_data("rushing", [year])
+            if not df.empty:
+                df = df[df.get("season_type", pd.Series(["REG"] * len(df))).eq("REG")] if "season_type" in df.columns else df
+                season_df = df[df["week"].isna()] if "week" in df.columns else df
+                if season_df.empty:
+                    season_df = df.groupby("player_gsis_id", as_index=False).mean(numeric_only=True)
+                    if "player_display_name" in df.columns:
+                        name_map = df.drop_duplicates("player_gsis_id")[["player_gsis_id", "player_display_name"]]
+                        season_df = season_df.merge(name_map, on="player_gsis_id", how="left")
+                if "player_display_name" in season_df.columns:
+                    season_df["name_norm"] = season_df["player_display_name"].apply(norm)
+                season_df.to_parquet(rush_path, index=False)
+                print(f"  [NGS Rushing {year}] Saved {len(season_df)} rows.")
+            else:
+                print(f"  [NGS Rushing {year}] Empty.")
+        except Exception as e:
+            print(f"  [NGS Rushing {year}] Error: {e}")
+    else:
+        print(f"  [NGS Rushing {year}] Already exists.")
+
+    # NGS Passing
+    pass_path = BACKEND / f"data_{year}_ngs_passing.parquet"
+    if not pass_path.exists():
+        print(f"  [NGS Passing {year}] Fetching...")
+        try:
+            df = nfl.import_ngs_data("passing", [year])
+            if not df.empty:
+                df = df[df.get("season_type", pd.Series(["REG"] * len(df))).eq("REG")] if "season_type" in df.columns else df
+                season_df = df[df["week"].isna()] if "week" in df.columns else df
+                if season_df.empty:
+                    season_df = df.groupby("player_gsis_id", as_index=False).mean(numeric_only=True)
+                    if "player_display_name" in df.columns:
+                        name_map = df.drop_duplicates("player_gsis_id")[["player_gsis_id", "player_display_name"]]
+                        season_df = season_df.merge(name_map, on="player_gsis_id", how="left")
+                if "player_display_name" in season_df.columns:
+                    season_df["name_norm"] = season_df["player_display_name"].apply(norm)
+                season_df.to_parquet(pass_path, index=False)
+                print(f"  [NGS Passing {year}] Saved {len(season_df)} rows.")
+            else:
+                print(f"  [NGS Passing {year}] Empty.")
+        except Exception as e:
+            print(f"  [NGS Passing {year}] Error: {e}")
+    else:
+        print(f"  [NGS Passing {year}] Already exists.")
+
+    # Snap counts
+    snaps_path = BACKEND / f"data_{year}_snaps.parquet"
+    if not snaps_path.exists():
+        print(f"  [Snaps {year}] Fetching...")
+        try:
+            df = nfl.import_snap_counts([year])
+            if not df.empty:
+                if "game_type" in df.columns:
+                    df = df[df["game_type"] == "REG"]
+                if "offense_pct" in df.columns:
+                    if "player" in df.columns:
+                        df["name_norm"] = df["player"].apply(norm)
+                        snap_season = df.groupby("name_norm", as_index=False)["offense_pct"].mean()
+                        snap_season.to_parquet(snaps_path, index=False)
+                        print(f"  [Snaps {year}] Saved {len(snap_season)} rows.")
+                    else:
+                        print(f"  [Snaps {year}] No 'player' column.")
+                else:
+                    print(f"  [Snaps {year}] No 'offense_pct' column.")
+            else:
+                print(f"  [Snaps {year}] Empty.")
+        except Exception as e:
+            print(f"  [Snaps {year}] Error: {e}")
+    else:
+        print(f"  [Snaps {year}] Already exists.")
+
+
 def fetch_season_stats(year: int) -> pd.DataFrame:
     """Fetch actual season stats for a given year using nfl_data_py."""
     out_path = BACKEND / f"data_{year}_season_stats.parquet"
@@ -369,6 +477,48 @@ def compute_value_score(adp_players: list[dict], stats_df: pd.DataFrame, year: i
     return merged
 
 
+def _load_ngs_snaps(year: int):
+    """Load NGS and snap data for a given year into dicts keyed by player_gsis_id or name_norm."""
+    ngs_recv, ngs_rush, ngs_pass, snaps = {}, {}, {}, {}
+
+    recv_path = BACKEND / f"data_{year}_ngs_receiving.parquet"
+    if recv_path.exists():
+        df = pd.read_parquet(recv_path)
+        id_col = "player_gsis_id" if "player_gsis_id" in df.columns else None
+        for _, r in df.iterrows():
+            key = r[id_col] if id_col and pd.notna(r.get(id_col)) else r.get("name_norm", "")
+            if key:
+                ngs_recv[key] = r
+
+    rush_path = BACKEND / f"data_{year}_ngs_rushing.parquet"
+    if rush_path.exists():
+        df = pd.read_parquet(rush_path)
+        id_col = "player_gsis_id" if "player_gsis_id" in df.columns else None
+        for _, r in df.iterrows():
+            key = r[id_col] if id_col and pd.notna(r.get(id_col)) else r.get("name_norm", "")
+            if key:
+                ngs_rush[key] = r
+
+    pass_path = BACKEND / f"data_{year}_ngs_passing.parquet"
+    if pass_path.exists():
+        df = pd.read_parquet(pass_path)
+        id_col = "player_gsis_id" if "player_gsis_id" in df.columns else None
+        for _, r in df.iterrows():
+            key = r[id_col] if id_col and pd.notna(r.get(id_col)) else r.get("name_norm", "")
+            if key:
+                ngs_pass[key] = r
+
+    snaps_path = BACKEND / f"data_{year}_snaps.parquet"
+    if snaps_path.exists():
+        df = pd.read_parquet(snaps_path)
+        for _, r in df.iterrows():
+            key = r.get("name_norm", "")
+            if key:
+                snaps[key] = r
+
+    return ngs_recv, ngs_rush, ngs_pass, snaps
+
+
 def build_feature_matrix(years_data: dict) -> pd.DataFrame:
     """
     Build the full feature matrix. For each player-season Y:
@@ -376,6 +526,13 @@ def build_feature_matrix(years_data: dict) -> pd.DataFrame:
     - Features: prior year (Y-1) and two-year prior (Y-2) stats
     """
     feature_rows = []
+
+    # Pre-load NGS/snap data for all years we'll need as prior year
+    ngs_cache = {}
+    for y in sorted(years_data.keys()):
+        prev_y = y - 1
+        if prev_y not in ngs_cache:
+            ngs_cache[prev_y] = _load_ngs_snaps(prev_y)
 
     for year in sorted(years_data.keys()):
         if year not in years_data:
@@ -390,9 +547,24 @@ def build_feature_matrix(years_data: dict) -> pd.DataFrame:
         prev_stats = years_data.get(prev_year, pd.DataFrame())
         prev2_stats = years_data.get(prev2_year, pd.DataFrame())
 
+        # Also load raw prev stats parquet for extra columns (targets, carries, etc.)
+        raw_prev_path = BACKEND / f"data_{prev_year}_season_stats.parquet"
+        if raw_prev_path.exists():
+            raw_prev = pd.read_parquet(raw_prev_path)
+            if "player_name" in raw_prev.columns:
+                raw_prev["name_norm"] = raw_prev["player_name"].apply(norm)
+            elif "player_display_name" in raw_prev.columns:
+                raw_prev["name_norm"] = raw_prev["player_display_name"].apply(norm)
+        else:
+            raw_prev = pd.DataFrame()
+
+        # NGS/snap dicts for prev year
+        ngs_recv, ngs_rush, ngs_pass, snaps = ngs_cache.get(prev_year, ({}, {}, {}, {}))
+
         for _, row in current.iterrows():
             name_n = row.get("name_norm", norm(row.get("name", "")))
             pos = row.get("position", "")
+            player_id = row.get("player_id", "")
 
             # Look up prior year stats
             if not prev_stats.empty and "name_norm" in prev_stats.columns:
@@ -405,8 +577,14 @@ def build_feature_matrix(years_data: dict) -> pd.DataFrame:
             else:
                 prev2_match = pd.DataFrame()
 
+            # Raw prev stats row for extra columns
+            if not raw_prev.empty and "name_norm" in raw_prev.columns:
+                raw_prev_match = raw_prev[raw_prev["name_norm"] == name_n]
+                rp = raw_prev_match.iloc[0] if not raw_prev_match.empty else None
+            else:
+                rp = None
+
             # Check if player has appeared in ANY prior season (not just Y-1)
-            # This correctly distinguishes injured veterans from true rookies
             has_any_prior = any(
                 not years_data.get(y, pd.DataFrame()).empty and
                 "name_norm" in years_data.get(y, pd.DataFrame()).columns and
@@ -424,14 +602,15 @@ def build_feature_matrix(years_data: dict) -> pd.DataFrame:
                 fp_prev = p.get("fantasy_points_ppr", 0) or 0
                 games_missed_prev = SEASON_GAMES.get(prev_year, 17) - games_prev
                 is_rookie = 0
+                prev_team = p.get("team", "")
             else:
                 weighted_ppg_prev = 0
                 ppg_prev = 0
                 games_prev = 0
                 fp_prev = 0
                 games_missed_prev = SEASON_GAMES.get(prev_year, 17)
-                # True rookie = never appeared in any prior season in our data
                 is_rookie = 0 if has_any_prior else 1
+                prev_team = ""
 
             # Two-year trend
             if not prev2_match.empty and not prev_match.empty:
@@ -444,7 +623,7 @@ def build_feature_matrix(years_data: dict) -> pd.DataFrame:
             # Age
             age = row.get("age", np.nan)
             if pd.isna(age):
-                age = 26  # league average if unknown
+                age = 26
 
             # Position one-hot
             pos_QB = int(pos == "QB")
@@ -452,13 +631,70 @@ def build_feature_matrix(years_data: dict) -> pd.DataFrame:
             pos_RB = int(pos == "RB")
             pos_TE = int(pos == "TE")
 
+            # ── New features from raw season stats ──
+            def _get(src, col, default=0):
+                if src is None:
+                    return default
+                v = src.get(col, default)
+                return default if pd.isna(v) else v
+
+            targets_prev = _get(rp, "targets", 0) if pos in ("WR", "TE", "RB") else 0
+            carries_prev = _get(rp, "carries", 0) if pos in ("RB", "QB") else 0
+            tgt_sh_prev = _get(rp, "tgt_sh", 0) if pos in ("WR", "TE", "RB") else 0
+            ay_sh_prev = _get(rp, "ay_sh", 0) if pos in ("WR", "TE") else 0
+            wopr_prev = _get(rp, "wopr_y", 0) if pos in ("WR", "TE", "RB") else 0
+            rec_epa_prev = _get(rp, "receiving_epa", 0) if pos != "QB" else 0
+            rush_epa_prev = _get(rp, "rushing_epa", 0) if pos not in ("WR", "TE") else 0
+            pass_epa_prev = _get(rp, "passing_epa", 0) if pos == "QB" else 0
+            dom_prev = _get(rp, "dom", 0)
+            years_exp_prev = _get(rp, "years_exp", 0)
+
+            # Team change: 1 if prev team != current team
+            current_team = row.get("team", "")
+            team_change = int(bool(prev_team) and bool(current_team) and prev_team != current_team)
+
+            # Derived opportunity rates
+            targets_per_game_prev = (targets_prev / games_prev) if games_prev > 0 and pos in ("WR", "TE", "RB") else 0
+            carries_per_game_prev = (carries_prev / games_prev) if games_prev > 0 and pos in ("RB", "QB") else 0
+            age_sq = float(age) ** 2
+
+            # ── NGS features — look up by player_id first, fallback to name_norm ──
+            def _ngs_lookup(ngs_dict, pid, nn):
+                row_data = ngs_dict.get(pid) if pid else None
+                if row_data is None:
+                    row_data = ngs_dict.get(nn)
+                return row_data
+
+            # NGS receiving (WR/TE only)
+            ngs_r = _ngs_lookup(ngs_recv, player_id, name_n) if pos in ("WR", "TE") else None
+            separation_prev = _get(ngs_r, "avg_separation", 0)
+            cushion_prev = _get(ngs_r, "avg_cushion", 0)
+            yac_above_exp_prev = _get(ngs_r, "avg_yac_above_expectation", 0)
+            catch_pct_prev = _get(ngs_r, "catch_percentage", 0)
+
+            # NGS rushing (RB only)
+            ngs_ru = _ngs_lookup(ngs_rush, player_id, name_n) if pos == "RB" else None
+            ryoe_per_att_prev = _get(ngs_ru, "rush_yards_over_expected_per_att", 0)
+            rush_pct_over_exp_prev = _get(ngs_ru, "rush_pct_over_expected", 0)
+            stacked_box_pct_prev = _get(ngs_ru, "percent_attempts_gte_eight_defenders", 0)
+
+            # NGS passing (QB only)
+            ngs_p = _ngs_lookup(ngs_pass, player_id, name_n) if pos == "QB" else None
+            cpoe_prev = _get(ngs_p, "completion_percentage_above_expectation", 0)
+            aggressiveness_prev = _get(ngs_p, "aggressiveness", 0)
+            qb_air_yards_prev = _get(ngs_p, "avg_intended_air_yards", 0)
+
+            # Snap pct
+            snap_row = snaps.get(name_n)
+            snap_pct_prev = _get(snap_row, "offense_pct", 0)
+
             feature_rows.append({
                 "season": year,
                 "name": row.get("name", ""),
                 "name_norm": name_n,
-                "player_id": row.get("player_id", ""),
+                "player_id": player_id,
                 "position": pos,
-                # Features
+                # Original features
                 "weighted_ppg_prev": weighted_ppg_prev,
                 "ppg_prev": ppg_prev,
                 "games_prev": games_prev,
@@ -474,6 +710,37 @@ def build_feature_matrix(years_data: dict) -> pd.DataFrame:
                 "pos_WR": pos_WR,
                 "pos_RB": pos_RB,
                 "pos_TE": pos_TE,
+                # New features from season stats
+                "targets_prev": targets_prev,
+                "carries_prev": carries_prev,
+                "tgt_sh_prev": tgt_sh_prev,
+                "ay_sh_prev": ay_sh_prev,
+                "wopr_prev": wopr_prev,
+                "rec_epa_prev": rec_epa_prev,
+                "rush_epa_prev": rush_epa_prev,
+                "pass_epa_prev": pass_epa_prev,
+                "dom_prev": dom_prev,
+                "years_exp_prev": years_exp_prev,
+                "team_change": team_change,
+                # NGS receiving
+                "separation_prev": separation_prev,
+                "cushion_prev": cushion_prev,
+                "yac_above_exp_prev": yac_above_exp_prev,
+                "catch_pct_prev": catch_pct_prev,
+                # NGS rushing
+                "ryoe_per_att_prev": ryoe_per_att_prev,
+                "rush_pct_over_exp_prev": rush_pct_over_exp_prev,
+                "stacked_box_pct_prev": stacked_box_pct_prev,
+                # NGS passing
+                "cpoe_prev": cpoe_prev,
+                "aggressiveness_prev": aggressiveness_prev,
+                "qb_air_yards_prev": qb_air_yards_prev,
+                # Snap
+                "snap_pct_prev": snap_pct_prev,
+                # Derived
+                "age_sq": age_sq,
+                "targets_per_game_prev": targets_per_game_prev,
+                "carries_per_game_prev": carries_per_game_prev,
                 # Target
                 "value_score": row.get("value_score", np.nan),
                 # For prediction output
@@ -487,11 +754,24 @@ def build_feature_matrix(years_data: dict) -> pd.DataFrame:
 
 
 FEATURE_COLS = [
+    # Original 14 features
     "weighted_ppg_prev", "ppg_prev", "games_prev", "fp_prev",
     "weighted_ppg_prev2", "trend_weighted_ppg",
     "age", "pos_adp_rank", "overall_adp",
     "games_missed_prev", "is_rookie",
     "pos_QB", "pos_WR", "pos_RB", "pos_TE",
+    # New: season stats
+    "targets_prev", "carries_prev", "tgt_sh_prev", "ay_sh_prev", "wopr_prev",
+    "rec_epa_prev", "rush_epa_prev", "pass_epa_prev", "dom_prev",
+    "years_exp_prev", "team_change",
+    # New: NGS receiving
+    "separation_prev", "cushion_prev", "yac_above_exp_prev", "catch_pct_prev",
+    # New: NGS rushing
+    "ryoe_per_att_prev", "rush_pct_over_exp_prev", "stacked_box_pct_prev",
+    # New: NGS passing
+    "cpoe_prev", "aggressiveness_prev", "qb_air_yards_prev",
+    # New: snaps + derived
+    "snap_pct_prev", "age_sq", "targets_per_game_prev", "carries_per_game_prev",
 ]
 
 
@@ -785,6 +1065,20 @@ def generate_2026_predictions(models, fm, years_data):
         elif "player_display_name" in stats_2024.columns:
             stats_2024["name_norm"] = stats_2024["player_display_name"].apply(norm)
 
+    # Load raw 2025 season stats parquet for extended columns
+    raw_2025_path = BACKEND / "data_2025_season_stats.parquet"
+    if raw_2025_path.exists():
+        raw_2025 = pd.read_parquet(raw_2025_path)
+        if "player_name" in raw_2025.columns:
+            raw_2025["name_norm"] = raw_2025["player_name"].apply(norm)
+        elif "player_display_name" in raw_2025.columns:
+            raw_2025["name_norm"] = raw_2025["player_display_name"].apply(norm)
+    else:
+        raw_2025 = pd.DataFrame()
+
+    # Load NGS + snap data for 2025 (prior year for 2026 predictions)
+    ngs_recv_2025, ngs_rush_2025, ngs_pass_2025, snaps_2025 = _load_ngs_snaps(2025)
+
     rows = []
     for name_n, adp_entry in adp_2026.items():
         pos = adp_entry.get("position", "")
@@ -798,7 +1092,6 @@ def generate_2026_predictions(models, fm, years_data):
             m = pd.DataFrame()
 
         # Check if player has appeared in ANY of the last 5 seasons
-        # (injured veterans like Tank Dell played 0 games in 2025 but are NOT rookies)
         prior_season_dfs = {
             yr: years_data.get(yr, pd.DataFrame())
             for yr in range(2021, 2026)
@@ -825,7 +1118,6 @@ def generate_2026_predictions(models, fm, years_data):
             games_prev = 0
             fp_prev = 0
             games_missed_prev = 17
-            # True rookie = no NFL stats in any prior season in our data
             is_rookie = 0 if has_any_prior else 1
             player_id = ""
             age = adp_entry.get("age", 23) or 23
@@ -842,6 +1134,60 @@ def generate_2026_predictions(models, fm, years_data):
         else:
             weighted_ppg_prev2 = 0
             trend = 0
+
+        # Raw 2025 stats for new feature columns
+        if not raw_2025.empty and "name_norm" in raw_2025.columns:
+            raw_m = raw_2025[raw_2025["name_norm"] == name_n]
+            rp = raw_m.iloc[0] if not raw_m.empty else None
+        else:
+            rp = None
+
+        def _get(src, col, default=0):
+            if src is None:
+                return default
+            v = src.get(col, default)
+            return default if pd.isna(v) else v
+
+        targets_prev = _get(rp, "targets", 0) if pos in ("WR", "TE", "RB") else 0
+        carries_prev = _get(rp, "carries", 0) if pos in ("RB", "QB") else 0
+        tgt_sh_prev = _get(rp, "tgt_sh", 0) if pos in ("WR", "TE", "RB") else 0
+        ay_sh_prev = _get(rp, "ay_sh", 0) if pos in ("WR", "TE") else 0
+        wopr_prev = _get(rp, "wopr_y", 0) if pos in ("WR", "TE", "RB") else 0
+        rec_epa_prev = _get(rp, "receiving_epa", 0) if pos != "QB" else 0
+        rush_epa_prev = _get(rp, "rushing_epa", 0) if pos not in ("WR", "TE") else 0
+        pass_epa_prev = _get(rp, "passing_epa", 0) if pos == "QB" else 0
+        dom_prev = _get(rp, "dom", 0)
+        years_exp_prev = _get(rp, "years_exp", 0)
+        team_change = 0  # unknown for 2026 predictions — teams may not be set yet
+
+        targets_per_game_prev = (targets_prev / games_prev) if games_prev > 0 and pos in ("WR", "TE", "RB") else 0
+        carries_per_game_prev = (carries_prev / games_prev) if games_prev > 0 and pos in ("RB", "QB") else 0
+        age_sq = float(age) ** 2
+
+        def _ngs_lookup(ngs_dict, pid, nn):
+            row_data = ngs_dict.get(pid) if pid else None
+            if row_data is None:
+                row_data = ngs_dict.get(nn)
+            return row_data
+
+        ngs_r = _ngs_lookup(ngs_recv_2025, player_id, name_n) if pos in ("WR", "TE") else None
+        separation_prev = _get(ngs_r, "avg_separation", 0)
+        cushion_prev = _get(ngs_r, "avg_cushion", 0)
+        yac_above_exp_prev = _get(ngs_r, "avg_yac_above_expectation", 0)
+        catch_pct_prev = _get(ngs_r, "catch_percentage", 0)
+
+        ngs_ru = _ngs_lookup(ngs_rush_2025, player_id, name_n) if pos == "RB" else None
+        ryoe_per_att_prev = _get(ngs_ru, "rush_yards_over_expected_per_att", 0)
+        rush_pct_over_exp_prev = _get(ngs_ru, "rush_pct_over_expected", 0)
+        stacked_box_pct_prev = _get(ngs_ru, "percent_attempts_gte_eight_defenders", 0)
+
+        ngs_p = _ngs_lookup(ngs_pass_2025, player_id, name_n) if pos == "QB" else None
+        cpoe_prev = _get(ngs_p, "completion_percentage_above_expectation", 0)
+        aggressiveness_prev = _get(ngs_p, "aggressiveness", 0)
+        qb_air_yards_prev = _get(ngs_p, "avg_intended_air_yards", 0)
+
+        snap_row = snaps_2025.get(name_n)
+        snap_pct_prev = _get(snap_row, "offense_pct", 0)
 
         rows.append({
             "name_norm": name_n,
@@ -864,6 +1210,31 @@ def generate_2026_predictions(models, fm, years_data):
             "pos_WR": int(pos == "WR"),
             "pos_RB": int(pos == "RB"),
             "pos_TE": int(pos == "TE"),
+            "targets_prev": targets_prev,
+            "carries_prev": carries_prev,
+            "tgt_sh_prev": tgt_sh_prev,
+            "ay_sh_prev": ay_sh_prev,
+            "wopr_prev": wopr_prev,
+            "rec_epa_prev": rec_epa_prev,
+            "rush_epa_prev": rush_epa_prev,
+            "pass_epa_prev": pass_epa_prev,
+            "dom_prev": dom_prev,
+            "years_exp_prev": years_exp_prev,
+            "team_change": team_change,
+            "separation_prev": separation_prev,
+            "cushion_prev": cushion_prev,
+            "yac_above_exp_prev": yac_above_exp_prev,
+            "catch_pct_prev": catch_pct_prev,
+            "ryoe_per_att_prev": ryoe_per_att_prev,
+            "rush_pct_over_exp_prev": rush_pct_over_exp_prev,
+            "stacked_box_pct_prev": stacked_box_pct_prev,
+            "cpoe_prev": cpoe_prev,
+            "aggressiveness_prev": aggressiveness_prev,
+            "qb_air_yards_prev": qb_air_yards_prev,
+            "snap_pct_prev": snap_pct_prev,
+            "age_sq": age_sq,
+            "targets_per_game_prev": targets_per_game_prev,
+            "carries_per_game_prev": carries_per_game_prev,
         })
 
     if not rows:
@@ -943,6 +1314,7 @@ def main():
         print(f"\n[Year {year}]")
         adp_players = fetch_adp(year)
         stats_df = fetch_season_stats(year)
+        fetch_ngs_snap_data(year)
 
         if not adp_players or stats_df.empty:
             print(f"  Skipping {year} due to missing data.")

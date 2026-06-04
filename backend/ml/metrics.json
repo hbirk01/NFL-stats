@@ -1,89 +1,89 @@
 {
   "ridge": {
-    "cv_spearman_avg": 0.587,
+    "cv_spearman_avg": 0.5814,
     "cv_folds": [
       {
         "season": 2021,
-        "spearman": 0.6247
+        "spearman": 0.6244
       },
       {
         "season": 2022,
-        "spearman": 0.6193
+        "spearman": 0.6197
       },
       {
         "season": 2023,
-        "spearman": 0.555
+        "spearman": 0.5334
       },
       {
         "season": 2024,
-        "spearman": 0.5531
+        "spearman": 0.545
       },
       {
         "season": 2025,
-        "spearman": 0.5826
+        "spearman": 0.5843
       }
     ],
     "best_alpha": 50.0
   },
   "random_forest": {
-    "cv_spearman_avg": 0.5824,
+    "cv_spearman_avg": 0.582,
     "cv_folds": [
       {
         "season": 2021,
-        "spearman": 0.6004
+        "spearman": 0.5974
       },
       {
         "season": 2022,
-        "spearman": 0.6127
+        "spearman": 0.6105
       },
       {
         "season": 2023,
-        "spearman": 0.5406
+        "spearman": 0.5311
       },
       {
         "season": 2024,
-        "spearman": 0.5566
+        "spearman": 0.5706
       },
       {
         "season": 2025,
-        "spearman": 0.6018
+        "spearman": 0.6003
       }
     ],
     "best_params": {
       "n_estimators": 100,
       "max_depth": 3,
-      "min_samples_leaf": 3
+      "min_samples_leaf": 5
     }
   },
   "xgboost": {
-    "cv_spearman_avg": 0.5721,
+    "cv_spearman_avg": 0.5547,
     "cv_folds": [
       {
         "season": 2021,
-        "spearman": 0.591
+        "spearman": 0.5762
       },
       {
         "season": 2022,
-        "spearman": 0.567
+        "spearman": 0.5651
       },
       {
         "season": 2023,
-        "spearman": 0.5506
+        "spearman": 0.5141
       },
       {
         "season": 2024,
-        "spearman": 0.5363
+        "spearman": 0.5447
       },
       {
         "season": 2025,
-        "spearman": 0.6159
+        "spearman": 0.5734
       }
     ],
     "best_params": {
       "lr": 0.05,
       "max_depth": 3,
       "n_est": 100,
-      "subsample": 1.0
+      "subsample": 0.7
     }
   }
 }
