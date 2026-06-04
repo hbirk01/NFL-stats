@@ -335,6 +335,7 @@ function PredictionsView({ onSelect }) {
   const [pos, setPos] = useState('ALL')
   const [startersOnly, setStartersOnly] = useState(false)
   const [minGames, setMinGames] = useState(8)
+  const [hideRookies, setHideRookies] = useState(false)
   const [showModels, setShowModels] = useState(false)
 
   useEffect(() => {
@@ -346,6 +347,7 @@ function PredictionsView({ onSelect }) {
 
   const filtered = picks
     .filter(p => pos === 'ALL' || p.position === pos)
+    .filter(p => !hideRookies || !p.is_rookie)
     .filter(p => !startersOnly || (
       p.prior_weighted_ppg >= (PPG_THRESHOLD[p.position] ?? 8) &&
       p.prior_games >= minGames
@@ -386,6 +388,16 @@ function PredictionsView({ onSelect }) {
             <span style={{ fontSize: 10, color: 'var(--muted)' }}>/ 17</span>
           </div>
         )}
+        <button
+          onClick={() => setHideRookies(s => !s)}
+          style={{
+            marginLeft: 8, padding: '4px 10px', borderRadius: 6, whiteSpace: 'nowrap',
+            border: `1px solid ${hideRookies ? 'var(--accent)' : 'var(--border)'}`,
+            background: hideRookies ? 'var(--accent)22' : 'transparent',
+            color: hideRookies ? 'var(--accent)' : 'var(--muted)',
+            fontSize: 11, fontWeight: 700, cursor: 'pointer',
+          }}
+        >🚫 Hide Rookies</button>
         <button
           onClick={() => setShowModels(s => !s)}
           style={{
