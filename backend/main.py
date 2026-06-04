@@ -1264,6 +1264,57 @@ def get_dynasty_value_picks():
     return {"picks": results[:50]}
 
 
+@app.get("/api/value-picks/predictions")
+def get_value_picks_predictions(position: str = None):
+    """
+    ML-predicted 2026 fantasy value picks.
+
+    Returns the top 50 players sorted by predicted_value_score (descending).
+    The score is z-score normalized 0-100 per position, where higher = more likely
+    to outperform their pre-season ADP in 2026.
+
+    Optional query param: ?position=WR  (QB|WR|RB|TE)
+    """
+    import os as _os
+    import json as _json
+    pred_file = _os.path.join(_os.path.dirname(__file__), "ml", "predictions_2026.json")
+    if not _os.path.exists(pred_file):
+        raise HTTPException(status_code=503, detail="Predictions not generated yet. Run ml/train_pipeline.py.")
+
+    with open(pred_file) as f:
+        data = _json.load(f)
+
+    players = data.get("players", [])
+
+    if position and position.upper() != "ALL":
+        players = [p for p in players if p.get("position", "").upper() == position.upper()]
+
+    # Already sorted by predicted_value_score desc
+    top50 = players[:50]
+
+    # Try to attach headshot_url from current player data
+    try:
+        cache = load_data()
+        players_df = cache["players"]
+        headshot_map = {r["player_id"]: r.get("headshot_url") for _, r in players_df.iterrows()}
+        name_headshot = {
+            (r["player_display_name"] or "").lower().replace("'", "").replace(".", "").replace("-", "").replace(" ", ""): r.get("headshot_url")
+            for _, r in players_df.iterrows() if r.get("player_display_name")
+        }
+        for p in top50:
+            pid = p.get("player_id", "")
+            name_n = (p.get("name", "") or "").lower().replace("'", "").replace(".", "").replace("-", "").replace(" ", "")
+            p["headshot_url"] = headshot_map.get(pid) or name_headshot.get(name_n)
+    except Exception:
+        pass
+
+    return {
+        "generated": data.get("generated"),
+        "count": len(top50),
+        "predictions": top50,
+    }
+
+
 # ── Static files (React build) ───────────────────────────────────────────────
 DIST = os.path.join(os.path.dirname(__file__), "..", "frontend", "dist")
 if os.path.isdir(DIST):
