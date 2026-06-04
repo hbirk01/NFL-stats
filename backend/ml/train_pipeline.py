@@ -405,6 +405,16 @@ def build_feature_matrix(years_data: dict) -> pd.DataFrame:
             else:
                 prev2_match = pd.DataFrame()
 
+            # Check if player has appeared in ANY prior season (not just Y-1)
+            # This correctly distinguishes injured veterans from true rookies
+            has_any_prior = any(
+                not years_data.get(y, pd.DataFrame()).empty and
+                "name_norm" in years_data.get(y, pd.DataFrame()).columns and
+                name_n in years_data[y]["name_norm"].values
+                for y in range(year - 5, year)
+                if y in years_data
+            )
+
             # Prior year features
             if not prev_match.empty:
                 p = prev_match.iloc[0]
@@ -420,7 +430,8 @@ def build_feature_matrix(years_data: dict) -> pd.DataFrame:
                 games_prev = 0
                 fp_prev = 0
                 games_missed_prev = SEASON_GAMES.get(prev_year, 17)
-                is_rookie = 1
+                # True rookie = never appeared in any prior season in our data
+                is_rookie = 0 if has_any_prior else 1
 
             # Two-year trend
             if not prev2_match.empty and not prev_match.empty:
@@ -486,10 +497,49 @@ FEATURE_COLS = [
 
 # ── Step 4: Train/val/test splits ─────────────────────────────────────────────
 
+def walk_forward_folds(fm: pd.DataFrame):
+    """
+    Walk-forward (expanding window) cross-validation — the correct approach for
+    temporal sports data. Each fold trains on all seasons up to year Y-1 and
+    tests on year Y. This gives 4 independent test folds instead of 1, so metrics
+    are far more reliable and representative of real predictive performance.
+
+    Random within-season splits are NOT used here because that would leak future
+    information: knowing some players' 2023 outcomes during training would let the
+    model implicitly learn 2023-era patterns that wouldn't be available pre-season.
+
+    Folds:
+      Fold 1: Train 2020        → Test 2021
+      Fold 2: Train 2020-2021   → Test 2022
+      Fold 3: Train 2020-2022   → Test 2023
+      Fold 4: Train 2020-2023   → Test 2024
+    """
+    all_seasons = sorted(fm["season"].dropna().unique())
+    # Only seasons where we have value_score (not the 2025/2026 prediction rows)
+    labeled = fm.dropna(subset=["value_score"])
+    labeled_seasons = sorted(labeled["season"].unique())
+
+    folds = []
+    for i in range(1, len(labeled_seasons)):
+        train_seasons = labeled_seasons[:i]
+        test_season   = labeled_seasons[i]
+        tr = labeled[labeled["season"].isin(train_seasons)]
+        te = labeled[labeled["season"] == test_season]
+        if len(tr) >= 10 and len(te) >= 10:
+            folds.append((train_seasons, test_season, tr, te))
+    return folds
+
+
 def get_splits(fm: pd.DataFrame):
-    train = fm[fm["season"].isin([2020, 2021, 2022])].dropna(subset=["value_score"])
-    val   = fm[fm["season"] == 2023].dropna(subset=["value_score"])
-    test  = fm[fm["season"] == 2024].dropna(subset=["value_score"])
+    """Legacy single split — kept for backward compat but walk_forward_folds is preferred."""
+    labeled = fm.dropna(subset=["value_score"])
+    seasons = sorted(labeled["season"].unique())
+    # Use last season as test, second-to-last as val, rest as train
+    test_season = seasons[-1]
+    val_season  = seasons[-2]
+    train = labeled[~labeled["season"].isin([test_season, val_season])]
+    val   = labeled[labeled["season"] == val_season]
+    test  = labeled[labeled["season"] == test_season]
     return train, val, test
 
 
@@ -503,100 +553,154 @@ def evaluate(y_true, y_pred, name=""):
 
 # ── Step 5: Train models ───────────────────────────────────────────────────────
 
-def train_models(train, val, test):
-    X_tr = train[FEATURE_COLS].fillna(0).values
-    y_tr = train["value_score"].values
-    X_va = val[FEATURE_COLS].fillna(0).values
-    y_va = val["value_score"].values
-    X_te = test[FEATURE_COLS].fillna(0).values
-    y_te = test["value_score"].values
+def train_models(fm: pd.DataFrame):
+    """
+    Walk-forward cross-validation for honest evaluation, then retrain final
+    models on ALL labeled data so predictions use the full history.
+    """
+    folds = walk_forward_folds(fm)
+    labeled = fm.dropna(subset=["value_score"])
+
+    print(f"\n  Walk-forward CV: {len(folds)} folds")
+    for tr_seasons, te_season, tr, te in folds:
+        print(f"    Train {tr_seasons} → Test {te_season}  ({len(tr)} / {len(te)} rows)")
 
     metrics = {}
     models = {}
 
-    # ── Ridge Regression ──
-    print("\n  Training Ridge...")
-    best_ridge, best_ridge_spearman = None, -999
-    for alpha in [0.1, 1.0, 5.0, 10.0, 50.0, 100.0]:
-        scaler = StandardScaler()
-        X_tr_s = scaler.fit_transform(X_tr)
-        X_va_s = scaler.transform(X_va)
-        r = Ridge(alpha=alpha)
-        r.fit(X_tr_s, y_tr)
-        pred_va = r.predict(X_va_s)
-        rho, _ = spearmanr(y_va, pred_va)
-        if rho > best_ridge_spearman:
-            best_ridge_spearman = rho
-            best_ridge = (r, scaler, alpha)
+    # ── Helper: evaluate across all folds ──
+    def cv_evaluate(model_fn, name):
+        """Run model_fn(X_tr, y_tr, X_va, y_va) → fitted model. Return avg Spearman + per-fold."""
+        fold_rhos = []
+        for tr_seasons, te_season, tr_fold, te_fold in folds:
+            # For hyperparameter selection: use the fold just before test as val
+            val_season = tr_seasons[-1] if len(tr_seasons) > 1 else tr_seasons[0]
+            tr_inner = tr_fold[tr_fold["season"] != val_season]
+            va_inner = tr_fold[tr_fold["season"] == val_season]
+            if len(tr_inner) < 5 or len(va_inner) < 5:
+                tr_inner, va_inner = tr_fold, te_fold  # fallback
+            X_tr = tr_inner[FEATURE_COLS].fillna(0).values
+            y_tr = tr_inner["value_score"].values
+            X_va = va_inner[FEATURE_COLS].fillna(0).values
+            y_va = va_inner["value_score"].values
+            X_te = te_fold[FEATURE_COLS].fillna(0).values
+            y_te = te_fold["value_score"].values
+            m = model_fn(X_tr, y_tr, X_va, y_va)
+            if isinstance(m, tuple):  # ridge returns (model, scaler)
+                pred = m[0].predict(m[1].transform(X_te))
+            else:
+                pred = m.predict(X_te)
+            rho, _ = spearmanr(y_te, pred)
+            fold_rhos.append((te_season, rho))
+        return fold_rhos
 
-    r_model, r_scaler, r_alpha = best_ridge
-    print(f"    Best Ridge alpha={r_alpha} val_spearman={best_ridge_spearman:.3f}")
-    X_te_s = r_scaler.transform(X_te)
-    pred_te = r_model.predict(X_te_s)
-    metrics["ridge"] = evaluate(y_te, pred_te, "Ridge (test)")
-    metrics["ridge"]["best_alpha"] = r_alpha
-    models["ridge"] = (r_model, r_scaler)
+    # ── Ridge ──
+    print("\n  Ridge — walk-forward CV...")
+    best_alpha = 1.0
+
+    def ridge_fn(X_tr, y_tr, X_va, y_va, alpha=None):
+        a = alpha or best_alpha
+        sc = StandardScaler(); X_tr_s = sc.fit_transform(X_tr); X_va_s = sc.transform(X_va)
+        r = Ridge(alpha=a); r.fit(X_tr_s, y_tr)
+        return (r, sc)
+
+    # Find best alpha using fold-average Spearman
+    best_alpha_val, best_alpha_rho = 1.0, -999
+    for alpha in [0.1, 1.0, 5.0, 10.0, 50.0]:
+        rhos = cv_evaluate(lambda X_tr, y_tr, X_va, y_va: ridge_fn(X_tr, y_tr, X_va, y_va, alpha), f"ridge_a{alpha}")
+        avg_rho = np.mean([r for _, r in rhos])
+        if avg_rho > best_alpha_rho:
+            best_alpha_rho = avg_rho; best_alpha_val = alpha
+    best_alpha = best_alpha_val
+
+    fold_rhos = cv_evaluate(ridge_fn, "Ridge")
+    for season, rho in fold_rhos:
+        print(f"    Fold test {season}: Spearman={rho:.3f}")
+    avg_rho = np.mean([r for _, r in fold_rhos])
+    print(f"    Ridge CV avg Spearman={avg_rho:.3f}  (best alpha={best_alpha})")
+    metrics["ridge"] = {"cv_spearman_avg": round(avg_rho, 4), "cv_folds": [{"season": s, "spearman": round(r, 4)} for s, r in fold_rhos], "best_alpha": best_alpha}
+
+    # Final model on all labeled data
+    X_all = labeled[FEATURE_COLS].fillna(0).values; y_all = labeled["value_score"].values
+    final_scaler = StandardScaler(); X_all_s = final_scaler.fit_transform(X_all)
+    final_ridge = Ridge(alpha=best_alpha); final_ridge.fit(X_all_s, y_all)
+    models["ridge"] = (final_ridge, final_scaler)
     with open(ML / "model_ridge.pkl", "wb") as f:
-        pickle.dump({"model": r_model, "scaler": r_scaler, "features": FEATURE_COLS}, f)
+        pickle.dump({"model": final_ridge, "scaler": final_scaler, "features": FEATURE_COLS}, f)
 
     # ── Random Forest ──
-    print("\n  Training Random Forest...")
-    best_rf, best_rf_spearman = None, -999
+    print("\n  Random Forest — walk-forward CV...")
+    best_rf_params = {"n_estimators": 100, "max_depth": 5, "min_samples_leaf": 3}
+    best_rf_rho = -999
     for n_est in [100, 200]:
         for max_depth in [3, 5, None]:
-            for min_samples in [3, 5]:
-                rf = RandomForestRegressor(
-                    n_estimators=n_est, max_depth=max_depth,
-                    min_samples_leaf=min_samples, random_state=42, n_jobs=-1
-                )
-                rf.fit(X_tr, y_tr)
-                pred_va = rf.predict(X_va)
-                rho, _ = spearmanr(y_va, pred_va)
-                if rho > best_rf_spearman:
-                    best_rf_spearman = rho
-                    best_rf = rf
+            for min_samp in [3, 5]:
+                def rf_fn(X_tr, y_tr, X_va, y_va, ne=n_est, md=max_depth, ms=min_samp):
+                    rf = RandomForestRegressor(n_estimators=ne, max_depth=md, min_samples_leaf=ms, random_state=42, n_jobs=-1)
+                    rf.fit(X_tr, y_tr); return rf
+                rhos = cv_evaluate(rf_fn, "RF")
+                avg = np.mean([r for _, r in rhos])
+                if avg > best_rf_rho:
+                    best_rf_rho = avg; best_rf_params = {"n_estimators": n_est, "max_depth": max_depth, "min_samples_leaf": min_samp}
 
-    print(f"    Best RF val_spearman={best_rf_spearman:.3f}")
-    pred_te = best_rf.predict(X_te)
-    metrics["random_forest"] = evaluate(y_te, pred_te, "Random Forest (test)")
-    models["random_forest"] = best_rf
+    def best_rf_fn(X_tr, y_tr, X_va, y_va):
+        rf = RandomForestRegressor(**best_rf_params, random_state=42, n_jobs=-1)
+        rf.fit(X_tr, y_tr); return rf
+    fold_rhos = cv_evaluate(best_rf_fn, "RF")
+    for season, rho in fold_rhos:
+        print(f"    Fold test {season}: Spearman={rho:.3f}")
+    avg_rho = np.mean([r for _, r in fold_rhos])
+    print(f"    RF CV avg Spearman={avg_rho:.3f}  params={best_rf_params}")
+    metrics["random_forest"] = {"cv_spearman_avg": round(avg_rho, 4), "cv_folds": [{"season": s, "spearman": round(r, 4)} for s, r in fold_rhos], "best_params": best_rf_params}
+
+    final_rf = RandomForestRegressor(**best_rf_params, random_state=42, n_jobs=-1)
+    final_rf.fit(X_all, y_all)
+    models["random_forest"] = final_rf
     with open(ML / "model_random_forest.pkl", "wb") as f:
-        pickle.dump({"model": best_rf, "features": FEATURE_COLS}, f)
+        pickle.dump({"model": final_rf, "features": FEATURE_COLS}, f)
 
     # ── XGBoost ──
-    print("\n  Training XGBoost...")
-    best_xgb_model, best_xgb_spearman = None, -999
-    best_xgb_params = {}
+    print("\n  XGBoost — walk-forward CV...")
+    best_xgb_params = {"lr": 0.05, "max_depth": 3, "n_est": 100, "subsample": 0.7}
+    best_xgb_rho = -999
     for lr in [0.05, 0.1]:
-        for max_depth in [3, 4, 5]:
+        for max_depth in [3, 4]:
             for n_est in [100, 200]:
                 for subsample in [0.7, 1.0]:
-                    xgb_m = xgb.XGBRegressor(
-                        n_estimators=n_est, max_depth=max_depth,
-                        learning_rate=lr, subsample=subsample,
-                        colsample_bytree=0.8, reg_alpha=0.1, reg_lambda=1.0,
-                        random_state=42, verbosity=0
-                    )
-                    xgb_m.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
-                    pred_va = xgb_m.predict(X_va)
-                    rho, _ = spearmanr(y_va, pred_va)
-                    if rho > best_xgb_spearman:
-                        best_xgb_spearman = rho
-                        best_xgb_model = xgb_m
-                        best_xgb_params = {"lr": lr, "max_depth": max_depth, "n_est": n_est, "subsample": subsample}
+                    def xgb_fn(X_tr, y_tr, X_va, y_va, lr=lr, md=max_depth, ne=n_est, ss=subsample):
+                        m = xgb.XGBRegressor(n_estimators=ne, max_depth=md, learning_rate=lr, subsample=ss, colsample_bytree=0.8, reg_alpha=0.1, reg_lambda=1.0, random_state=42, verbosity=0)
+                        m.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False); return m
+                    rhos = cv_evaluate(xgb_fn, "XGB")
+                    avg = np.mean([r for _, r in rhos])
+                    if avg > best_xgb_rho:
+                        best_xgb_rho = avg; best_xgb_params = {"lr": lr, "max_depth": max_depth, "n_est": n_est, "subsample": subsample}
 
-    print(f"    Best XGBoost params={best_xgb_params} val_spearman={best_xgb_spearman:.3f}")
-    pred_te = best_xgb_model.predict(X_te)
-    metrics["xgboost"] = evaluate(y_te, pred_te, "XGBoost (test)")
-    metrics["xgboost"]["best_params"] = best_xgb_params
-    models["xgboost"] = best_xgb_model
+    def best_xgb_fn(X_tr, y_tr, X_va, y_va):
+        m = xgb.XGBRegressor(n_estimators=best_xgb_params["n_est"], max_depth=best_xgb_params["max_depth"], learning_rate=best_xgb_params["lr"], subsample=best_xgb_params["subsample"], colsample_bytree=0.8, reg_alpha=0.1, reg_lambda=1.0, random_state=42, verbosity=0)
+        m.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False); return m
+    fold_rhos = cv_evaluate(best_xgb_fn, "XGB")
+    for season, rho in fold_rhos:
+        print(f"    Fold test {season}: Spearman={rho:.3f}")
+    avg_rho = np.mean([r for _, r in fold_rhos])
+    print(f"    XGBoost CV avg Spearman={avg_rho:.3f}  params={best_xgb_params}")
+    metrics["xgboost"] = {"cv_spearman_avg": round(avg_rho, 4), "cv_folds": [{"season": s, "spearman": round(r, 4)} for s, r in fold_rhos], "best_params": best_xgb_params}
+
+    X_va_all = labeled[FEATURE_COLS].fillna(0).values  # use all for final eval set
+    final_xgb = xgb.XGBRegressor(n_estimators=best_xgb_params["n_est"], max_depth=best_xgb_params["max_depth"], learning_rate=best_xgb_params["lr"], subsample=best_xgb_params["subsample"], colsample_bytree=0.8, reg_alpha=0.1, reg_lambda=1.0, random_state=42, verbosity=0)
+    final_xgb.fit(X_all, y_all)
+    models["xgboost"] = final_xgb
     with open(ML / "model_xgboost.pkl", "wb") as f:
-        pickle.dump({"model": best_xgb_model, "features": FEATURE_COLS, "params": best_xgb_params}, f)
+        pickle.dump({"model": final_xgb, "features": FEATURE_COLS, "params": best_xgb_params}, f)
 
-    # Save metrics
+    def _to_py(obj):
+        if isinstance(obj, (np.integer,)): return int(obj)
+        if isinstance(obj, (np.floating,)): return float(obj)
+        if isinstance(obj, dict): return {k: _to_py(v) for k, v in obj.items()}
+        if isinstance(obj, list): return [_to_py(v) for v in obj]
+        return obj
     with open(ML / "metrics.json", "w") as f:
-        json.dump(metrics, f, indent=2)
-    print(f"\n  Metrics saved to {ML}/metrics.json")
+        json.dump(_to_py(metrics), f, indent=2)
+    print(f"\n  Metrics saved → {ML}/metrics.json")
 
     return models, metrics
 
@@ -693,6 +797,18 @@ def generate_2026_predictions(models, fm, years_data):
         else:
             m = pd.DataFrame()
 
+        # Check if player has appeared in ANY of the last 5 seasons
+        # (injured veterans like Tank Dell played 0 games in 2025 but are NOT rookies)
+        prior_season_dfs = {
+            yr: years_data.get(yr, pd.DataFrame())
+            for yr in range(2021, 2026)
+            if yr in years_data
+        }
+        has_any_prior = any(
+            not df.empty and "name_norm" in df.columns and name_n in df["name_norm"].values
+            for df in prior_season_dfs.values()
+        )
+
         if not m.empty:
             p = m.iloc[0]
             weighted_ppg_prev = p.get("weighted_ppg", 0) or 0
@@ -709,7 +825,8 @@ def generate_2026_predictions(models, fm, years_data):
             games_prev = 0
             fp_prev = 0
             games_missed_prev = 17
-            is_rookie = 1
+            # True rookie = no NFL stats in any prior season in our data
+            is_rookie = 0 if has_any_prior else 1
             player_id = ""
             age = adp_entry.get("age", 23) or 23
 
@@ -865,25 +982,24 @@ def main():
 
     print(f"\n  Season distribution:\n{fm.groupby('season')['value_score'].describe().round(2)}")
 
-    # ── Train/val/test splits ──
-    train, val, test = get_splits(fm)
-    print(f"\n[Splits] Train: {len(train)} | Val: {len(val)} | Test: {len(test)}")
+    labeled = fm.dropna(subset=["value_score"])
+    print(f"\n[Walk-forward CV] {len(labeled)} labeled rows across seasons: {sorted(labeled['season'].unique())}")
 
-    if len(train) < 10:
-        print("ERROR: Not enough training data. Check data collection.")
+    if len(labeled) < 20:
+        print("ERROR: Not enough labeled data. Check data collection.")
         return
 
-    # ── Train models ──
+    # ── Train models (walk-forward CV + final refit on all data) ──
     print("\n[Training]")
-    models, metrics = train_models(train, val, test)
+    models, metrics = train_models(fm)
 
     # Print summary
     print("\n[Test Set Results]")
     for name, m in metrics.items():
-        print(f"  {name}: Spearman={m['spearman']:.3f} MAE={m['mae']:.2f} RMSE={m['rmse']:.2f}")
+        print(f"  {name}: CV avg Spearman={m['cv_spearman_avg']:.3f}  folds={[f['spearman'] for f in m['cv_folds']]}")
 
-    best_model = max(metrics, key=lambda k: metrics[k]["spearman"])
-    print(f"\n  Best model by Spearman: {best_model} (rho={metrics[best_model]['spearman']:.3f})")
+    best_model = max(metrics, key=lambda k: metrics[k]["cv_spearman_avg"])
+    print(f"\n  Best model by CV Spearman: {best_model} (avg rho={metrics[best_model]['cv_spearman_avg']:.3f})")
 
     # ── Load raw stats dict for 2026 predictions ──
     raw_stats = {}

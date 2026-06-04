@@ -1,27 +1,89 @@
 {
   "ridge": {
-    "mae": 11.41798605879778,
-    "rmse": 13.657017915424161,
-    "spearman": 0.5499093863984519,
-    "spearman_pval": 3.596269839284433e-16,
-    "best_alpha": 0.1
+    "cv_spearman_avg": 0.587,
+    "cv_folds": [
+      {
+        "season": 2021,
+        "spearman": 0.6247
+      },
+      {
+        "season": 2022,
+        "spearman": 0.6193
+      },
+      {
+        "season": 2023,
+        "spearman": 0.555
+      },
+      {
+        "season": 2024,
+        "spearman": 0.5531
+      },
+      {
+        "season": 2025,
+        "spearman": 0.5826
+      }
+    ],
+    "best_alpha": 50.0
   },
   "random_forest": {
-    "mae": 11.376643693267276,
-    "rmse": 13.523912305589356,
-    "spearman": 0.5590579799383865,
-    "spearman_pval": 9.128301137824512e-17
+    "cv_spearman_avg": 0.5824,
+    "cv_folds": [
+      {
+        "season": 2021,
+        "spearman": 0.6004
+      },
+      {
+        "season": 2022,
+        "spearman": 0.6127
+      },
+      {
+        "season": 2023,
+        "spearman": 0.5406
+      },
+      {
+        "season": 2024,
+        "spearman": 0.5566
+      },
+      {
+        "season": 2025,
+        "spearman": 0.6018
+      }
+    ],
+    "best_params": {
+      "n_estimators": 100,
+      "max_depth": 3,
+      "min_samples_leaf": 3
+    }
   },
   "xgboost": {
-    "mae": 11.286139712625996,
-    "rmse": 13.560142626238745,
-    "spearman": 0.5580869434764407,
-    "spearman_pval": 1.0579410225388287e-16,
+    "cv_spearman_avg": 0.5721,
+    "cv_folds": [
+      {
+        "season": 2021,
+        "spearman": 0.591
+      },
+      {
+        "season": 2022,
+        "spearman": 0.567
+      },
+      {
+        "season": 2023,
+        "spearman": 0.5506
+      },
+      {
+        "season": 2024,
+        "spearman": 0.5363
+      },
+      {
+        "season": 2025,
+        "spearman": 0.6159
+      }
+    ],
     "best_params": {
       "lr": 0.05,
       "max_depth": 3,
       "n_est": 100,
-      "subsample": 0.7
+      "subsample": 1.0
     }
   }
 }
