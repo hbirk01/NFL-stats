@@ -136,6 +136,7 @@ function ValuePicksView({ onSelect }) {
   const [loading, setLoading] = useState(true)
   const [pos, setPos] = useState('ALL')
   const [startersOnly, setStartersOnly] = useState(false)
+  const [minGames, setMinGames] = useState(8)
 
   useEffect(() => {
     fetch('/api/value-picks')
@@ -146,7 +147,10 @@ function ValuePicksView({ onSelect }) {
 
   const filtered = picks
     .filter(p => pos === 'ALL' || p.position === pos)
-    .filter(p => !startersOnly || (p.ppg != null && p.ppg >= (PPG_THRESHOLD[p.position] ?? 8)))
+    .filter(p => !startersOnly || (
+      p.ppg != null && p.ppg >= (PPG_THRESHOLD[p.position] ?? 8) &&
+      (p.games ?? 0) >= minGames
+    ))
 
   if (loading) return <div className="spinner" />
 
@@ -179,6 +183,30 @@ function ValuePicksView({ onSelect }) {
         >
           ⚡ Starters Only
         </button>
+        {startersOnly && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginLeft: 6 }}>
+            <span style={{ fontSize: 11, color: 'var(--muted)', whiteSpace: 'nowrap' }}>Min games:</span>
+            <input
+              type="number"
+              min={1}
+              max={17}
+              value={minGames}
+              onChange={e => setMinGames(Math.max(1, Math.min(17, Number(e.target.value))))}
+              style={{
+                width: 44,
+                padding: '2px 6px',
+                borderRadius: 5,
+                border: '1px solid var(--border)',
+                background: 'var(--surface2)',
+                color: 'var(--text)',
+                fontSize: 12,
+                fontWeight: 700,
+                textAlign: 'center',
+              }}
+            />
+            <span style={{ fontSize: 10, color: 'var(--muted)' }}>/ 17</span>
+          </div>
+        )}
         <span style={{ color: 'var(--muted)', fontSize: 12, marginLeft: 'auto' }}>{filtered.length} players</span>
       </div>
 
@@ -240,6 +268,11 @@ function ValuePicksView({ onSelect }) {
                 </div>
                 <div style={{ fontSize: 11, color: 'var(--muted)' }}>
                   {p.ppg != null ? <><b style={{ color: 'var(--text)' }}>{p.ppg.toFixed(1)}</b> PPG</> : '—'}
+                  {p.games != null && (
+                    <span style={{ marginLeft: 6, color: p.games < 8 ? 'var(--red)' : 'var(--muted)' }}>
+                      · <b style={{ color: p.games < 8 ? 'var(--red)' : 'var(--text)' }}>{p.games}</b>G
+                    </span>
+                  )}
                 </div>
               </div>
               <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4, minWidth: 64 }}>
