@@ -119,7 +119,7 @@ function FantasyCard({ player, rank, sort, onClick }) {
   )
 }
 
-const VIEWS = ['Rankings', 'Value Picks', 'Strength of Schedule']
+const VIEWS = ['Rankings', 'Value Picks', '2026 Predictions', 'Strength of Schedule']
 
 const PPG_THRESHOLD = { QB: 13, WR: 9, RB: 7, TE: 7, ALL: 8 }
 
@@ -305,6 +305,197 @@ function ValuePicksView({ onSelect }) {
   )
 }
 
+function scoreColor(score) {
+  if (score >= 65) return 'var(--green)'
+  if (score >= 55) return '#a3e635'
+  if (score >= 45) return '#f5a623'
+  return 'var(--red)'
+}
+
+function ModelBar({ ridge, rf, xgb }) {
+  const models = [{ label: 'Ridge', val: ridge }, { label: 'RF', val: rf }, { label: 'XGB', val: xgb }]
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 3, minWidth: 100 }}>
+      {models.map(({ label, val }) => (
+        <div key={label} style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+          <span style={{ fontSize: 9, color: 'var(--muted)', width: 26 }}>{label}</span>
+          <div style={{ flex: 1, height: 5, background: 'var(--border)', borderRadius: 3, overflow: 'hidden' }}>
+            <div style={{ width: `${val ?? 0}%`, height: '100%', background: scoreColor(val), borderRadius: 3, transition: 'width 0.3s' }} />
+          </div>
+          <span style={{ fontSize: 9, color: 'var(--muted)', width: 22, textAlign: 'right' }}>{val?.toFixed(0)}</span>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function PredictionsView({ onSelect }) {
+  const [picks, setPicks] = useState([])
+  const [loading, setLoading] = useState(true)
+  const [pos, setPos] = useState('ALL')
+  const [startersOnly, setStartersOnly] = useState(false)
+  const [minGames, setMinGames] = useState(8)
+  const [showModels, setShowModels] = useState(false)
+
+  useEffect(() => {
+    fetch('/api/value-picks/predictions')
+      .then(r => r.json())
+      .then(d => { setPicks(d.predictions || d); setLoading(false) })
+      .catch(() => setLoading(false))
+  }, [])
+
+  const filtered = picks
+    .filter(p => pos === 'ALL' || p.position === pos)
+    .filter(p => !startersOnly || (
+      p.prior_weighted_ppg >= (PPG_THRESHOLD[p.position] ?? 8) &&
+      p.prior_games >= minGames
+    ))
+
+  if (loading) return <div className="spinner" />
+
+  return (
+    <div>
+      <p style={{ fontSize: 13, color: 'var(--muted)', marginBottom: 16 }}>
+        ML model predictions for 2026 — who is likely to outperform their ADP.
+        <span style={{ fontSize: 11, display: 'block', marginTop: 3 }}>
+          Ensemble of Ridge, Random Forest &amp; XGBoost · trained on 2020–2022 · validated on 2023 · tested on 2024 (Spearman ρ = 0.56)
+        </span>
+      </p>
+
+      <div className="filters" style={{ marginBottom: 16 }}>
+        {POSITIONS.map(p => (
+          <button key={p} className={`filter-btn pos-${p} ${pos === p ? 'active' : ''}`} onClick={() => setPos(p)}>{p}</button>
+        ))}
+        <button
+          onClick={() => setStartersOnly(s => !s)}
+          style={{
+            marginLeft: 8, padding: '4px 10px', borderRadius: 6, whiteSpace: 'nowrap',
+            border: `1px solid ${startersOnly ? 'var(--accent)' : 'var(--border)'}`,
+            background: startersOnly ? 'var(--accent)22' : 'transparent',
+            color: startersOnly ? 'var(--accent)' : 'var(--muted)',
+            fontSize: 11, fontWeight: 700, cursor: 'pointer',
+          }}
+        >⚡ Starters Only</button>
+        {startersOnly && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginLeft: 6 }}>
+            <span style={{ fontSize: 11, color: 'var(--muted)', whiteSpace: 'nowrap' }}>Min games:</span>
+            <input type="number" min={1} max={17} value={minGames}
+              onChange={e => setMinGames(Math.max(1, Math.min(17, Number(e.target.value))))}
+              style={{ width: 44, padding: '2px 6px', borderRadius: 5, border: '1px solid var(--border)', background: 'var(--surface2)', color: 'var(--text)', fontSize: 12, fontWeight: 700, textAlign: 'center' }}
+            />
+            <span style={{ fontSize: 10, color: 'var(--muted)' }}>/ 17</span>
+          </div>
+        )}
+        <button
+          onClick={() => setShowModels(s => !s)}
+          style={{
+            marginLeft: 8, padding: '4px 10px', borderRadius: 6,
+            border: `1px solid ${showModels ? 'var(--accent)' : 'var(--border)'}`,
+            background: showModels ? 'var(--accent)22' : 'transparent',
+            color: showModels ? 'var(--accent)' : 'var(--muted)',
+            fontSize: 11, fontWeight: 700, cursor: 'pointer',
+          }}
+        >🔬 Show Models</button>
+        <span style={{ color: 'var(--muted)', fontSize: 12, marginLeft: 'auto' }}>{filtered.length} players</span>
+      </div>
+
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+        {filtered.map((p, i) => {
+          const color = POS_COLORS[p.position] || 'var(--accent)'
+          const sc = scoreColor(p.predicted_value_score)
+          const score = p.predicted_value_score ?? 0
+          const lowConf = p.confidence > 8
+
+          return (
+            <div
+              key={p.player_id || p.name}
+              onClick={() => onSelect && onSelect(p)}
+              style={{
+                background: 'var(--surface)', border: '1px solid var(--border)',
+                borderLeft: `3px solid ${sc}`, borderRadius: 10, padding: '12px 16px',
+                cursor: 'pointer', display: 'grid',
+                gridTemplateColumns: `32px 1fr auto ${showModels ? '110px' : ''} 64px`,
+                alignItems: 'center', gap: 12,
+              }}
+              onMouseEnter={e => { e.currentTarget.style.background = 'var(--surface2)' }}
+              onMouseLeave={e => { e.currentTarget.style.background = 'var(--surface)' }}
+            >
+              {/* Rank */}
+              <div style={{ fontWeight: 800, fontSize: 15, color: 'var(--muted)', textAlign: 'center' }}>{i + 1}</div>
+
+              {/* Player */}
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }}>
+                {p.headshot_url
+                  ? <img src={p.headshot_url} alt="" style={{ width: 40, height: 40, borderRadius: '50%', objectFit: 'cover', flexShrink: 0 }} onError={e => e.target.style.display = 'none'} />
+                  : <div style={{ width: 40, height: 40, borderRadius: '50%', background: color + '22', flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 14, color }}>{p.position?.[0]}</div>
+                }
+                <div style={{ minWidth: 0 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                    <span style={{ fontWeight: 700, fontSize: 14, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{p.name}</span>
+                    {p.is_rookie && <span style={{ fontSize: 9, fontWeight: 700, background: 'var(--accent)33', color: 'var(--accent)', padding: '1px 5px', borderRadius: 3 }}>ROOKIE</span>}
+                    {lowConf && <span style={{ fontSize: 9, fontWeight: 700, background: '#f5a62333', color: '#f5a623', padding: '1px 5px', borderRadius: 3 }}>LOW CONF</span>}
+                  </div>
+                  <div style={{ fontSize: 11, color: 'var(--muted)' }}>
+                    <span style={{ fontWeight: 700, color, background: color + '22', padding: '1px 5px', borderRadius: 3, marginRight: 5 }}>{p.position}</span>
+                    {p.team}
+                    {p.age && <span style={{ marginLeft: 6 }}>· {p.age.toFixed(1)}y</span>}
+                  </div>
+                </div>
+              </div>
+
+              {/* ADP + prior stats */}
+              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4, minWidth: 150 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                  <div style={{ textAlign: 'center' }}>
+                    <div style={{ fontSize: 10, color: 'var(--muted)', fontWeight: 600, textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 2 }}>2026 ADP</div>
+                    <div style={{ fontSize: 15, fontWeight: 700 }}>{p.position}{p.pos_adp_rank ?? '—'}</div>
+                  </div>
+                  <div style={{ textAlign: 'center' }}>
+                    <div style={{ fontSize: 10, color: 'var(--muted)', fontWeight: 600, textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 2 }}>2025 wPPG</div>
+                    <div style={{ fontSize: 15, fontWeight: 700, color: p.prior_weighted_ppg > 0 ? 'var(--text)' : 'var(--muted)' }}>
+                      {p.prior_weighted_ppg > 0 ? p.prior_weighted_ppg.toFixed(1) : p.is_rookie ? 'Rookie' : '—'}
+                    </div>
+                  </div>
+                  <div style={{ textAlign: 'center' }}>
+                    <div style={{ fontSize: 10, color: 'var(--muted)', fontWeight: 600, textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 2 }}>2025 G</div>
+                    <div style={{ fontSize: 15, fontWeight: 700, color: p.prior_games < 8 && !p.is_rookie ? 'var(--red)' : 'var(--text)' }}>
+                      {p.prior_games > 0 ? p.prior_games : '—'}
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Model breakdown (optional) */}
+              {showModels && <ModelBar ridge={p.ridge_pred} rf={p.rf_pred} xgb={p.xgb_pred} />}
+
+              {/* Predicted score */}
+              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4, minWidth: 64 }}>
+                <div style={{ fontSize: 22, fontWeight: 900, color: sc, lineHeight: 1 }}>{score.toFixed(0)}</div>
+                <div style={{ width: 48, height: 5, background: 'var(--border)', borderRadius: 3, overflow: 'hidden' }}>
+                  <div style={{ width: `${score}%`, height: '100%', background: sc, borderRadius: 3 }} />
+                </div>
+                <div style={{ fontSize: 9, fontWeight: 700, color: sc, textTransform: 'uppercase', letterSpacing: 0.5 }}>
+                  {score >= 65 ? 'Strong' : score >= 55 ? 'Likely' : score >= 45 ? 'Neutral' : 'Unlikely'}
+                </div>
+              </div>
+            </div>
+          )
+        })}
+      </div>
+
+      <div style={{ marginTop: 14, display: 'flex', gap: 16, fontSize: 11, color: 'var(--muted)' }}>
+        {[['Strong', 'var(--green)', '65+'], ['Likely', '#a3e635', '55–64'], ['Neutral', '#f5a623', '45–54'], ['Unlikely', 'var(--red)', '<45']].map(([label, c, range]) => (
+          <div key={label} style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+            <div style={{ width: 10, height: 10, background: c, borderRadius: 2 }} />
+            <span>{label} <span style={{ opacity: 0.6 }}>({range})</span></span>
+          </div>
+        ))}
+        <span style={{ marginLeft: 'auto' }}>Confidence = std across 3 models · higher = models disagree</span>
+      </div>
+    </div>
+  )
+}
+
 export default function FantasyTab() {
   const [pos, setPos] = useState('ALL')
   const [sort, setSort] = useState('fantasy_points_ppr')
@@ -363,6 +554,10 @@ export default function FantasyTab() {
 
       {view === 'Value Picks' && (
         <ValuePicksView onSelect={p => setSelected(p)} />
+      )}
+
+      {view === '2026 Predictions' && (
+        <PredictionsView onSelect={p => setSelected(p)} />
       )}
 
       {view === 'Strength of Schedule' && (
