@@ -1694,6 +1694,316 @@ def get_dynasty_picks():
     return result
 
 
+# ── CB Coverage System ───────────────────────────────────────────────────────
+
+_cb_cache: dict = {}
+
+def _load_cb_data(year: int = 2025):
+    """Load all CB data files for a given season."""
+    import pandas as pd, time
+    key = f"cb_data_{year}"
+    if _cb_cache.get(key) and time.time() - _cb_cache.get(f"{key}_ts", 0) < 3600:
+        return _cb_cache[key]
+
+    base = os.path.dirname(__file__)
+    def safe_read(name):
+        p = os.path.join(base, f"data_{year}_{name}.parquet")
+        if os.path.exists(p):
+            return pd.read_parquet(p)
+        return pd.DataFrame()
+
+    data = {
+        "cb_stats": safe_read("cb_stats"),
+        "team_coverage": safe_read("team_coverage"),
+        "route_coverage": safe_read("route_coverage"),
+        "cb_depth": safe_read("cb_depth"),
+    }
+    _cb_cache[key] = data
+    _cb_cache[f"{key}_ts"] = time.time()
+    return data
+
+
+@app.get("/api/cb/rankings")
+def get_cb_rankings(team: str = "", year: int = 2025):
+    """All CB coverage stats, optionally filtered by team."""
+    import time
+    cache_key = f"cb_rankings_{team}_{year}"
+    if _sleeper_cache.get(cache_key) and time.time() - _sleeper_cache.get(f"{cache_key}_ts", 0) < 3600:
+        return _sleeper_cache[cache_key]
+
+    data = _load_cb_data(year)
+    cb_stats = data["cb_stats"]
+    cb_depth = data["cb_depth"]
+
+    if cb_stats.empty:
+        return {"cbs": []}
+
+    # Merge depth chart slot
+    def _norm(n): return (n or "").lower().replace("'","").replace(".","").replace("-","").replace(" ","")
+    if not cb_depth.empty:
+        slot_map = {_norm(r["player_name"]): r.get("cb_slot","") for _, r in cb_depth.iterrows()}
+    else:
+        slot_map = {}
+
+    # Filter by team
+    stats = cb_stats.copy()
+    if team:
+        team_upper = team.upper()
+        stats = stats[stats["team"] == team_upper]
+
+    # Require minimum games played
+    stats = stats[stats["games"] >= 4].copy()
+
+    result = []
+    for _, row in stats.iterrows():
+        result.append({
+            "name": row.get("pfr_player_name", ""),
+            "pfr_id": row.get("pfr_player_id", ""),
+            "team": row.get("team", ""),
+            "season": int(year),
+            "games": int(row.get("games", 0)),
+            "targets_per_game": float(row.get("targets_per_game", 0) or 0),
+            "comp_pct": float(row.get("comp_pct", 0) or 0),
+            "yards_per_target": float(row.get("yards_per_target", 0) or 0),
+            "td_per_target": float(row.get("td_per_target", 0) or 0),
+            "passer_rating_allowed": float(row.get("avg_passer_rating", 0) or 0),
+            "adot": float(row.get("avg_adot", 0) or 0),
+            "coverage_quality": float(row.get("coverage_quality", 50) or 50),
+            "coverage_grade": row.get("coverage_grade", "—"),
+            "cb_slot": slot_map.get(_norm(row.get("pfr_player_name","")), ""),
+        })
+
+    result.sort(key=lambda x: x["coverage_quality"], reverse=True)
+    out = {"cbs": result, "count": len(result)}
+    _sleeper_cache[cache_key] = out
+    _sleeper_cache[f"{cache_key}_ts"] = time.time()
+    return out
+
+
+@app.get("/api/cb/team-matchup")
+def get_cb_team_matchup(team: str, opponent: str, year: int = 2025):
+    """
+    Full WR vs CB matchup breakdown for a team playing an opponent.
+    Returns:
+      - opponent's starting CBs (LCB1, RCB1, slot) with coverage stats
+      - opponent's coverage scheme tendencies (man% / zone%)
+      - route advantage analysis (which routes work best vs their scheme)
+    """
+    import time
+    cache_key = f"matchup_{team}_{opponent}_{year}"
+    if _sleeper_cache.get(cache_key) and time.time() - _sleeper_cache.get(f"{cache_key}_ts", 0) < 3600:
+        return _sleeper_cache[cache_key]
+
+    data = _load_cb_data(year)
+    cb_stats = data["cb_stats"]
+    team_cov = data["team_coverage"]
+    route_cov = data["route_coverage"]
+    cb_depth = data["cb_depth"]
+
+    def _norm(n): return (n or "").lower().replace("'","").replace(".","").replace("-","").replace(" ","")
+
+    # --- Opponent's CBs ---
+    opp_upper = opponent.upper()
+    opp_cbs_depth = cb_depth[cb_depth["team"] == opp_upper] if not cb_depth.empty else []
+
+    cb_name_map = {}
+    if not cb_stats.empty:
+        for _, r in cb_stats.iterrows():
+            cb_name_map[_norm(r.get("pfr_player_name",""))] = r
+
+    def enrich_cb(player_name, slot):
+        nn = _norm(player_name)
+        raw = cb_name_map.get(nn)
+        stats = dict(raw) if raw is not None and hasattr(raw, 'to_dict') else (raw or {})
+        # Fallback: last name + first initial ("Pat" vs "Patrick")
+        if not stats and len(player_name.split()) >= 2:
+            parts = player_name.split()
+            last = _norm(" ".join(parts[1:]))
+            first_init = parts[0][0].lower()
+            for key, val in cb_name_map.items():
+                if key.endswith(last) and key.startswith(first_init):
+                    stats = dict(val) if hasattr(val, 'to_dict') else (val or {})
+                    break
+        return {
+            "name": player_name,
+            "slot": slot,
+            "team": opp_upper,
+            "games": int(stats.get("games", 0) or 0),
+            "targets_per_game": float(stats.get("targets_per_game", 0) or 0),
+            "comp_pct": float(stats.get("comp_pct", 0) or 0),
+            "yards_per_target": float(stats.get("yards_per_target", 0) or 0),
+            "passer_rating_allowed": float(stats.get("avg_passer_rating", 95) or 95),
+            "coverage_quality": float(stats.get("coverage_quality", 50) or 50),
+            "coverage_grade": stats.get("coverage_grade", "—"),
+            "has_stats": bool(stats),
+        }
+
+    starting_cbs = []
+    if not isinstance(opp_cbs_depth, list) and not opp_cbs_depth.empty:
+        for _, row in opp_cbs_depth.iterrows():
+            starting_cbs.append(enrich_cb(row["player_name"], row.get("cb_slot", "")))
+    starting_cbs.sort(key=lambda x: x["coverage_quality"], reverse=True)
+
+    # --- Opponent's coverage scheme ---
+    scheme = {}
+    if not team_cov.empty:
+        opp_row = team_cov[team_cov["defteam"] == opp_upper]
+        if not opp_row.empty:
+            r = opp_row.iloc[0]
+            scheme = {
+                "pct_man": float(r.get("pct_man", 0.3)),
+                "pct_zone": float(r.get("pct_zone", 0.7)),
+                "total_plays": int(r.get("total_plays", 0)),
+            }
+            # Add per-coverage breakdown
+            for col in opp_row.columns:
+                if col.startswith("pct_") and col not in ("pct_man", "pct_zone"):
+                    scheme[col] = float(r[col] or 0)
+    if not scheme:
+        scheme = {"pct_man": 0.3, "pct_zone": 0.7, "total_plays": 0}
+
+    is_man_heavy = scheme.get("pct_man", 0) >= 0.4
+    scheme["coverage_tendency"] = "Man-heavy" if is_man_heavy else "Zone-heavy"
+    scheme["tendency_pct"] = scheme.get("pct_man") if is_man_heavy else scheme.get("pct_zone")
+
+    # --- Route advantage vs scheme ---
+    route_advice = []
+    if not route_cov.empty:
+        man_pct = scheme.get("pct_man", 0.3)
+
+        for route in route_cov["route"].unique():
+            r_man = route_cov[(route_cov["route"] == route) & (route_cov["coverage_type"] == "man")]
+            r_zone = route_cov[(route_cov["route"] == route) & (route_cov["coverage_type"] == "zone")]
+
+            if r_man.empty or r_zone.empty:
+                continue
+
+            man_ypa = float(r_man.iloc[0]["ypa"])
+            zone_ypa = float(r_zone.iloc[0]["ypa"])
+            man_comp = float(r_man.iloc[0]["comp_pct"])
+            zone_comp = float(r_zone.iloc[0]["comp_pct"])
+
+            # Weighted YPA based on opponent's actual coverage distribution
+            expected_ypa = man_pct * man_ypa + (1 - man_pct) * zone_ypa
+            expected_comp = man_pct * man_comp + (1 - man_pct) * zone_comp
+
+            # Is this route better vs this team's scheme vs average?
+            avg_ypa = 0.3 * man_ypa + 0.7 * zone_ypa  # league avg scheme
+            route_edge = expected_ypa - avg_ypa
+
+            route_advice.append({
+                "route": route,
+                "expected_ypa": round(expected_ypa, 2),
+                "expected_comp_pct": round(expected_comp, 3),
+                "man_ypa": round(man_ypa, 2),
+                "zone_ypa": round(zone_ypa, 2),
+                "route_edge": round(route_edge, 2),
+                "recommendation": (
+                    "Target" if route_edge >= 0.2 else
+                    "Avoid" if route_edge <= -0.2 else "Neutral"
+                ),
+            })
+
+        route_advice.sort(key=lambda x: x["route_edge"], reverse=True)
+
+    result = {
+        "team": team.upper(),
+        "opponent": opp_upper,
+        "season": year,
+        "starting_cbs": starting_cbs,
+        "scheme": scheme,
+        "route_advice": route_advice,
+        "summary": (
+            f"{opp_upper} plays {scheme['coverage_tendency']} ({round(scheme['tendency_pct']*100)}%). "
+            f"{'Target deep routes and corners.' if not is_man_heavy else 'Target quick routes (slants, screens) that beat man coverage.'}"
+        ),
+    }
+
+    _sleeper_cache[cache_key] = result
+    _sleeper_cache[f"{cache_key}_ts"] = time.time()
+    return result
+
+
+@app.get("/api/cb/wr-impact")
+def get_wr_cb_impact(player_id: str, opponent: str, year: int = 2025):
+    """
+    Predict CB matchup impact on a specific WR for a given opponent.
+    Cross-references WR route tree with opponent CB quality and scheme.
+    """
+    import time, json as _json
+    cache_key = f"wr_impact_{player_id}_{opponent}_{year}"
+    if _sleeper_cache.get(cache_key) and time.time() - _sleeper_cache.get(f"{cache_key}_ts", 0) < 3600:
+        return _sleeper_cache[cache_key]
+
+    # Get WR's route tree from existing PBP data
+    data = load_data()
+    players_df = data["players"]
+    wr_row = players_df[players_df["player_id"] == player_id]
+    if wr_row.empty:
+        raise HTTPException(status_code=404, detail="Player not found")
+
+    wr = dict(wr_row.iloc[0])
+    wr_name = wr.get("player_display_name", "")
+    wr_team = wr.get("recent_team", "")
+    wr_pos = wr.get("position", "WR")
+
+    # Get matchup data
+    matchup = get_cb_team_matchup(team=wr_team, opponent=opponent, year=year)
+    scheme = matchup.get("scheme", {})
+    route_advice = matchup.get("route_advice", [])
+    cbs = matchup.get("starting_cbs", [])
+
+    # WR baseline stats
+    games = float(wr.get("games") or 0)
+    fpts = float(wr.get("fantasy_points_ppr") or 0)
+    ppg = round(fpts / games, 1) if games > 0 else 0.0
+    targets = float(wr.get("targets") or 0)
+    tpg = round(targets / games, 1) if games > 0 else 0.0
+
+    # Likely CB matchup: CB1 for outside WR, NB for slot
+    # (Simple heuristic — we don't have exact lineup info)
+    primary_cb = None
+    if cbs:
+        # Best CB (highest quality) for WR1 matchup
+        primary_cb = cbs[0]
+
+    # Coverage quality impact on WR production
+    # League avg CB quality ~50; elite CB = ~75-80, replacement = ~30
+    cb_quality = primary_cb["coverage_quality"] if primary_cb else 50
+    # Each 10-pt quality above avg reduces WR output ~5%
+    cb_impact_pct = (50 - cb_quality) / 10 * 0.05  # positive = boost, negative = penalty
+    adjusted_ppg = round(ppg * (1 + cb_impact_pct), 1)
+
+    # Top target routes for this WR
+    target_routes = [r for r in route_advice if r["recommendation"] == "Target"][:3]
+    avoid_routes = [r for r in route_advice if r["recommendation"] == "Avoid"][:3]
+
+    result = {
+        "player_id": player_id,
+        "name": wr_name,
+        "team": wr_team,
+        "position": wr_pos,
+        "opponent": opponent.upper(),
+        "baseline_ppg": ppg,
+        "baseline_tpg": tpg,
+        "projected_ppg": adjusted_ppg,
+        "cb_impact_pct": round(cb_impact_pct * 100, 1),
+        "primary_cb": primary_cb,
+        "scheme": scheme,
+        "target_routes": target_routes,
+        "avoid_routes": avoid_routes,
+        "verdict": (
+            "Favorable" if cb_impact_pct >= 0.03 else
+            "Tough" if cb_impact_pct <= -0.03 else
+            "Neutral"
+        ),
+    }
+
+    _sleeper_cache[cache_key] = result
+    _sleeper_cache[f"{cache_key}_ts"] = time.time()
+    return result
+
+
 # ── Static files (React build) ───────────────────────────────────────────────
 DIST = os.path.join(os.path.dirname(__file__), "..", "frontend", "dist")
 if os.path.isdir(DIST):

@@ -8,14 +8,29 @@ import WRRouteTree from './deepdive/WRRouteTree'
 import QBPressure from './deepdive/QBPressure'
 import RBRushDetail from './deepdive/RBRushDetail'
 import PlayerSOSCard from './PlayerSOSCard'
+import CBMatchup from './deepdive/CBMatchup'
 
 export default function PlayerDetail({ player, onBack }) {
   const [report, setReport] = useState(null)
   const [loadingReport, setLoadingReport] = useState(false)
+  const [cbOpponent, setCbOpponent] = useState('')
+  const [sosOpponents, setSosOpponents] = useState([])
 
   const pos = player.position
   const color = POS_COLORS[pos] || 'var(--accent)'
   const stats = detailStats(player)
+
+  // Fetch SOS opponents for CB matchup picker
+  useEffect(() => {
+    if (!['WR','TE'].includes(player.position)) return
+    fetch(`/api/players/${player.player_id}/sos`)
+      .then(r => r.json())
+      .then(d => {
+        const opps = (d.opponents || []).map(o => o.opponent).filter(Boolean)
+        setSosOpponents([...new Set(opps)])
+      })
+      .catch(() => {})
+  }, [player.player_id, player.position])
 
   useEffect(() => {
     setLoadingReport(true)
@@ -79,6 +94,26 @@ export default function PlayerDetail({ player, onBack }) {
       {pos === 'TE' && <WRRouteTree playerId={player.player_id} />}
       {pos === 'QB' && <QBPressure playerId={player.player_id} />}
       {pos === 'RB' && <RBRushDetail playerId={player.player_id} />}
+
+      {/* CB Matchup — WR and TE only */}
+      {(pos === 'WR' || pos === 'TE') && (
+        <div className="chart-wrap" style={{ marginBottom: 20 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
+            <h4 style={{ margin: 0 }}>CB Matchup Analysis</h4>
+            <select
+              value={cbOpponent}
+              onChange={e => setCbOpponent(e.target.value)}
+              style={{ padding: '5px 10px', borderRadius: 7, border: '1px solid var(--border)', background: 'var(--surface2)', color: 'var(--text)', fontSize: 12, outline: 'none', cursor: 'pointer' }}
+            >
+              <option value="">Select opponent…</option>
+              {sosOpponents.map(opp => (
+                <option key={opp} value={opp}>{opp}</option>
+              ))}
+            </select>
+          </div>
+          <CBMatchup player={player} opponent={cbOpponent} />
+        </div>
+      )}
 
       <div className="scouting-report">
         <h3>⚡ AI Scouting Report</h3>
