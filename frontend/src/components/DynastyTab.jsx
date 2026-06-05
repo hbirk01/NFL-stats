@@ -532,17 +532,25 @@ function StandingsView({ standings, myTeam }) {
 // ─── Trade Analyzer View ──────────────────────────────────────────────────────
 function TradeAnalyzerView() {
   const [allPlayers, setAllPlayers] = useState([])
+  const [allPicks, setAllPicks] = useState([])
   const [loading, setLoading] = useState(true)
   const [mySide, setMySide] = useState([])
   const [theirSide, setTheirSide] = useState([])
   const [mySearch, setMySearch] = useState('')
   const [theirSearch, setTheirSearch] = useState('')
+  const [myPickOpen, setMyPickOpen] = useState(false)
+  const [theirPickOpen, setTheirPickOpen] = useState(false)
+  const [pickSearch, setPickSearch] = useState('')
 
   useEffect(() => {
-    fetch('/api/dynasty/positional-rankings?position=ALL')
-      .then(r => r.json())
-      .then(d => { setAllPlayers(d.players || []); setLoading(false) })
-      .catch(() => setLoading(false))
+    Promise.all([
+      fetch('/api/dynasty/positional-rankings?position=ALL').then(r => r.json()),
+      fetch('/api/dynasty/picks').then(r => r.json()),
+    ]).then(([playersData, picksData]) => {
+      setAllPlayers(playersData.players || [])
+      setAllPicks(picksData.picks || [])
+      setLoading(false)
+    }).catch(() => setLoading(false))
   }, [])
 
   function addPlayer(side, player) {
@@ -604,6 +612,12 @@ function TradeAnalyzerView() {
           onRemove={idx => removePlayer('my', idx)}
           totalValue={myValue}
           color="var(--accent)"
+          picks={allPicks}
+          pickSearch={pickSearch}
+          onPickSearch={setPickSearch}
+          pickOpen={myPickOpen}
+          onPickOpen={() => { setMyPickOpen(o => !o); setTheirPickOpen(false); setPickSearch('') }}
+          onAddPick={p => { addPlayer('my', { ...p, player_id: `pick_${p.name}`, age: null }); setMyPickOpen(false) }}
         />
         {/* Their Side */}
         <TradeSide
@@ -616,6 +630,12 @@ function TradeAnalyzerView() {
           onRemove={idx => removePlayer('their', idx)}
           totalValue={theirValue}
           color="var(--wr)"
+          picks={allPicks}
+          pickSearch={pickSearch}
+          onPickSearch={setPickSearch}
+          pickOpen={theirPickOpen}
+          onPickOpen={() => { setTheirPickOpen(o => !o); setMyPickOpen(false); setPickSearch('') }}
+          onAddPick={p => { addPlayer('their', { ...p, player_id: `pick_${p.name}`, age: null }); setTheirPickOpen(false) }}
         />
       </div>
 
@@ -665,7 +685,13 @@ function TradeAnalyzerView() {
   )
 }
 
-function TradeSide({ label, players, search, onSearch, suggestions, onAdd, onRemove, totalValue, color }) {
+function TradeSide({ label, players, search, onSearch, suggestions, onAdd, onRemove, totalValue, color,
+  picks, pickSearch, onPickSearch, pickOpen, onPickOpen, onAddPick }) {
+
+  const filteredPicks = picks
+    ? picks.filter(p => !pickSearch || p.name.toLowerCase().includes(pickSearch.toLowerCase())).slice(0, 20)
+    : []
+
   return (
     <div style={{ background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 12, padding: 20 }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
@@ -673,43 +699,88 @@ function TradeSide({ label, players, search, onSearch, suggestions, onAdd, onRem
         <div style={{ fontSize: 13, color: 'var(--muted)' }}>Total: <span style={{ fontWeight: 700, color }}>{totalValue.toLocaleString()}</span></div>
       </div>
 
-      {/* Search */}
-      {players.length < 4 && (
-        <div style={{ position: 'relative', marginBottom: 12 }}>
-          <input
-            value={search}
-            onChange={e => onSearch(e.target.value)}
-            placeholder="Search players..."
-            style={{ width: '100%', padding: '8px 12px', borderRadius: 8, border: '1px solid var(--border)', background: 'var(--surface2)', color: 'var(--text)', fontSize: 13, outline: 'none', boxSizing: 'border-box' }}
-          />
-          {suggestions.length > 0 && (
-            <div style={{ position: 'absolute', top: '100%', left: 0, right: 0, background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 8, zIndex: 100, boxShadow: '0 4px 20px rgba(0,0,0,0.4)', marginTop: 4 }}>
-              {suggestions.map((p, i) => (
-                <div key={i} onClick={() => onAdd(p)}
-                  style={{ padding: '8px 14px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 10, borderBottom: i < suggestions.length - 1 ? '1px solid var(--border)' : 'none' }}
-                  onMouseEnter={e => e.currentTarget.style.background = 'var(--surface2)'}
-                  onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
-                  <span style={{ fontSize: 11, fontWeight: 700, color: POS_COLORS[p.position], background: (POS_COLORS[p.position] || '#888') + '22', padding: '1px 5px', borderRadius: 4 }}>{p.position}</span>
-                  <span style={{ fontSize: 13, fontWeight: 600 }}>{p.name}</span>
-                  <span style={{ fontSize: 11, color: 'var(--muted)', marginLeft: 'auto' }}>{p.dynasty_value?.toLocaleString() || '—'}</span>
+      {/* Search + Add Pick button */}
+      {players.length < 6 && (
+        <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
+          <div style={{ position: 'relative', flex: 1 }}>
+            <input
+              value={search}
+              onChange={e => onSearch(e.target.value)}
+              placeholder="Search players..."
+              style={{ width: '100%', padding: '8px 12px', borderRadius: 8, border: '1px solid var(--border)', background: 'var(--surface2)', color: 'var(--text)', fontSize: 13, outline: 'none', boxSizing: 'border-box' }}
+            />
+            {suggestions.length > 0 && (
+              <div style={{ position: 'absolute', top: '100%', left: 0, right: 0, background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 8, zIndex: 100, boxShadow: '0 4px 20px rgba(0,0,0,0.4)', marginTop: 4 }}>
+                {suggestions.map((p, i) => (
+                  <div key={i} onClick={() => onAdd(p)}
+                    style={{ padding: '8px 14px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 10, borderBottom: i < suggestions.length - 1 ? '1px solid var(--border)' : 'none' }}
+                    onMouseEnter={e => e.currentTarget.style.background = 'var(--surface2)'}
+                    onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
+                    <span style={{ fontSize: 11, fontWeight: 700, color: POS_COLORS[p.position], background: (POS_COLORS[p.position] || '#888') + '22', padding: '1px 5px', borderRadius: 4 }}>{p.position}</span>
+                    <span style={{ fontSize: 13, fontWeight: 600 }}>{p.name}</span>
+                    <span style={{ fontSize: 11, color: 'var(--muted)', marginLeft: 'auto' }}>{p.dynasty_value?.toLocaleString() || '—'}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+          {/* Add Pick button */}
+          <div style={{ position: 'relative' }}>
+            <button
+              onClick={onPickOpen}
+              style={{
+                padding: '8px 12px', borderRadius: 8, border: `1px solid ${pickOpen ? color : 'var(--border)'}`,
+                background: pickOpen ? color + '22' : 'var(--surface2)', color: pickOpen ? color : 'var(--muted)',
+                fontSize: 12, fontWeight: 700, cursor: 'pointer', whiteSpace: 'nowrap',
+              }}
+            >
+              🎟 + Pick
+            </button>
+            {pickOpen && (
+              <div style={{ position: 'absolute', top: '100%', right: 0, width: 280, background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 10, zIndex: 200, boxShadow: '0 8px 32px rgba(0,0,0,0.5)', marginTop: 6, overflow: 'hidden' }}>
+                <div style={{ padding: '10px 12px', borderBottom: '1px solid var(--border)' }}>
+                  <input
+                    autoFocus
+                    value={pickSearch}
+                    onChange={e => onPickSearch(e.target.value)}
+                    placeholder="Search picks (e.g. 2026 1st)..."
+                    style={{ width: '100%', padding: '6px 10px', borderRadius: 6, border: '1px solid var(--border)', background: 'var(--surface2)', color: 'var(--text)', fontSize: 12, outline: 'none', boxSizing: 'border-box' }}
+                  />
                 </div>
-              ))}
-            </div>
-          )}
+                <div style={{ maxHeight: 280, overflowY: 'auto' }}>
+                  {filteredPicks.map((pk, i) => (
+                    <div key={i} onClick={() => onAddPick(pk)}
+                      style={{ padding: '8px 12px', cursor: 'pointer', display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: i < filteredPicks.length - 1 ? '1px solid var(--border)' : 'none' }}
+                      onMouseEnter={e => e.currentTarget.style.background = 'var(--surface2)'}
+                      onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                        <span style={{ fontSize: 10, fontWeight: 700, color: '#f59e0b', background: '#f59e0b22', padding: '1px 5px', borderRadius: 4 }}>PICK</span>
+                        <span style={{ fontSize: 13, fontWeight: 600 }}>{pk.name}</span>
+                      </div>
+                      <span style={{ fontSize: 11, color: 'var(--muted)', fontWeight: 600 }}>{pk.dynasty_value?.toLocaleString()}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
         </div>
       )}
 
-      {/* Players */}
+      {/* Players + Picks */}
       <div style={{ display: 'flex', flexDirection: 'column', gap: 8, minHeight: 80 }}>
         {players.length === 0 && (
-          <div style={{ color: 'var(--muted)', fontSize: 13, textAlign: 'center', paddingTop: 20 }}>Add up to 4 players</div>
+          <div style={{ color: 'var(--muted)', fontSize: 13, textAlign: 'center', paddingTop: 20 }}>Add players or picks</div>
         )}
         {players.map((p, i) => (
-          <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 10px', background: 'var(--surface2)', borderRadius: 8 }}>
-            {posBadge(p.position)}
+          <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 10px', background: 'var(--surface2)', borderRadius: 8, borderLeft: p.position === 'PICK' ? '3px solid #f59e0b' : '3px solid transparent' }}>
+            {p.position === 'PICK'
+              ? <span style={{ fontSize: 11, fontWeight: 700, color: '#f59e0b', background: '#f59e0b22', padding: '2px 6px', borderRadius: 4, whiteSpace: 'nowrap' }}>🎟 PICK</span>
+              : posBadge(p.position)
+            }
             <div style={{ flex: 1 }}>
               <div style={{ fontSize: 13, fontWeight: 600 }}>{p.name}</div>
-              <div style={{ fontSize: 11, color: 'var(--muted)' }}>Age {p.age ?? '?'}</div>
+              {p.age != null && <div style={{ fontSize: 11, color: 'var(--muted)' }}>Age {p.age}</div>}
             </div>
             <div style={{ width: 80 }}>{dynastyValueBar(p.dynasty_value || 0)}</div>
             <button onClick={() => onRemove(i)} style={{ background: 'none', border: 'none', color: 'var(--red)', cursor: 'pointer', fontSize: 16, padding: '0 4px' }}>×</button>

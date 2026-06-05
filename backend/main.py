@@ -1653,6 +1653,47 @@ def get_dynasty_positional_rankings(position: str = "ALL"):
     return result
 
 
+@app.get("/api/dynasty/picks")
+def get_dynasty_picks():
+    """Draft pick values from FantasyCalc dynasty data."""
+    import time
+    cache_key = "dynasty_picks"
+    if _sleeper_cache.get(cache_key) and time.time() - _sleeper_cache.get(f"{cache_key}_ts", 0) < 86400:
+        return _sleeper_cache[cache_key]
+
+    dyn_data = get_dynasty_adp.__wrapped__() if hasattr(get_dynasty_adp, '__wrapped__') else None
+    # Re-fetch raw FantasyCalc data to get PICK entries (filtered out of dynasty_adp endpoint)
+    import httpx
+    try:
+        resp = httpx.get(
+            "https://api.fantasycalc.com/values/current?isDynasty=true&numQbs=1",
+            timeout=10, headers={"User-Agent": "GridIron/1.0"}
+        )
+        resp.raise_for_status()
+        fc_data = resp.json()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"FantasyCalc unavailable: {e}")
+
+    picks = []
+    for entry in fc_data:
+        p = entry.get("player", {})
+        if p.get("position") != "PICK":
+            continue
+        name = p.get("name", "")
+        picks.append({
+            "name": name,
+            "dynasty_value": entry.get("value", 0),
+            "overall_rank": entry.get("overallRank"),
+            "position": "PICK",
+        })
+
+    picks.sort(key=lambda x: x.get("overall_rank") or 999)
+    result = {"picks": picks}
+    _sleeper_cache[cache_key] = result
+    _sleeper_cache[f"{cache_key}_ts"] = time.time()
+    return result
+
+
 # ── Static files (React build) ───────────────────────────────────────────────
 DIST = os.path.join(os.path.dirname(__file__), "..", "frontend", "dist")
 if os.path.isdir(DIST):
