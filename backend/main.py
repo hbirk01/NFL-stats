@@ -1317,54 +1317,36 @@ def get_value_picks_predictions(position: str = None):
 
 # ── Sleeper League Integration ───────────────────────────────────────────────
 
-SLEEPER_USER_ID = "986073473632010240"
-SLEEPER_LEAGUE_ID = "1180308902364819456"
 _sleeper_cache: dict = {}
 
-@app.get("/api/sleeper/league")
-def get_sleeper_league():
-    """Dynasty Men league overview: standings, all rosters, scoring."""
-    import time, httpx
+def _norm(n):
+    return (n or "").lower().replace("'","").replace(".","").replace("-","").replace(" ","")
 
-    cache_key = "league"
-    if _sleeper_cache.get(cache_key) and time.time() - _sleeper_cache.get(f"{cache_key}_ts", 0) < 3600:
-        return _sleeper_cache[cache_key]
-
-    try:
-        with httpx.Client(timeout=10) as client:
-            league_r   = client.get(f"https://api.sleeper.app/v1/league/{SLEEPER_LEAGUE_ID}")
-            rosters_r  = client.get(f"https://api.sleeper.app/v1/league/{SLEEPER_LEAGUE_ID}/rosters")
-            users_r    = client.get(f"https://api.sleeper.app/v1/league/{SLEEPER_LEAGUE_ID}/users")
-            players_r  = client.get("https://api.sleeper.app/v1/players/nfl")
-
-        league_data = league_r.json()
-        rosters     = rosters_r.json()
-        users       = users_r.json()
-        all_players = players_r.json()
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Sleeper API unavailable: {e}")
-
-    user_map = {u["user_id"]: {"name": u["display_name"], "avatar": u.get("metadata", {}).get("avatar") or u.get("avatar")} for u in users}
-
-    # Load our stat data for cross-referencing
-    data = load_data()
-    players_df = data["players"]
-    stat_map = {r["player_id"]: r for _, r in players_df.iterrows()}
-
-    # Load 2026 predictions
+def _load_pred_maps():
+    """Load ML predictions indexed by player_id and by norm(name)."""
+    import json as _json, os as _os
+    pred_file = _os.path.join(_os.path.dirname(__file__), "ml", "predictions_2026.json")
     pred_map = {}
+    pred_name_map = {}
     try:
-        import json as _json, os as _os
-        pred_file = _os.path.join(_os.path.dirname(__file__), "ml", "predictions_2026.json")
         with open(pred_file) as f:
             preds = _json.load(f)["players"]
         pred_map = {p["player_id"]: p for p in preds if p.get("player_id")}
-        # Also index by name norm for fallback
-        def _norm(n): return (n or "").lower().replace("'","").replace(".","").replace("-","").replace(" ","")
         pred_name_map = {_norm(p["name"]): p for p in preds}
     except Exception:
-        pred_name_map = {}
+        pass
+    return pred_map, pred_name_map
 
+def _load_dynasty_map():
+    """Return dynasty values indexed by norm(name)."""
+    try:
+        dyn = get_dynasty_adp()
+        return {_norm(p["name"]): p for p in dyn["players"]}
+    except Exception:
+        return {}
+
+def _make_resolve_player(all_players, players_df, stat_map, pred_map, pred_name_map, dynasty_name_map):
+    """Factory that returns a resolve_player closure with the given lookups."""
     def resolve_player(sleeper_id: str):
         sp = all_players.get(sleeper_id, {})
         name = sp.get("full_name") or sp.get("search_full_name", "")
@@ -1384,6 +1366,7 @@ def get_sleeper_league():
             stats = {}
 
         pred = pred_map.get(gsis) or pred_name_map.get(_norm(name), {})
+        dyn  = dynasty_name_map.get(_norm(name), {})
 
         ppg = None
         weighted_ppg = None
@@ -1414,12 +1397,107 @@ def get_sleeper_league():
             "predicted_value_score_2026": pred.get("predicted_value_score"),
             "is_top_dog": pred.get("is_top_dog"),
             "adp_gap_to_teammate": pred.get("adp_gap_to_teammate"),
+            # Dynasty values
+            "dynasty_value": dyn.get("dynasty_value"),
+            "dynasty_rank": dyn.get("dynasty_rank"),
+            "dynasty_pos_rank": dyn.get("dynasty_pos_rank"),
+            "dynasty_tier": dyn.get("dynasty_tier"),
         }
+    return resolve_player
+
+
+@app.get("/api/sleeper/leagues")
+def get_sleeper_leagues(username: str):
+    """Fetch NFL leagues for a Sleeper username (tries 2026 first, falls back to 2025)."""
+    import time, httpx
+
+    cache_key = f"leagues_{username}"
+    if _sleeper_cache.get(cache_key) and time.time() - _sleeper_cache.get(f"{cache_key}_ts", 0) < 3600:
+        return _sleeper_cache[cache_key]
+
+    try:
+        with httpx.Client(timeout=10) as client:
+            user_r = client.get(f"https://api.sleeper.app/v1/user/{username}")
+            user_r.raise_for_status()
+            user_data = user_r.json()
+            user_id = user_data["user_id"]
+
+            leagues_r = client.get(f"https://api.sleeper.app/v1/user/{user_id}/leagues/nfl/2026")
+            leagues = leagues_r.json() or []
+            if not leagues:
+                leagues_r = client.get(f"https://api.sleeper.app/v1/user/{user_id}/leagues/nfl/2025")
+                leagues = leagues_r.json() or []
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Sleeper API unavailable: {e}")
+
+    results = []
+    for lg in leagues:
+        results.append({
+            "league_id": lg.get("league_id"),
+            "name": lg.get("name"),
+            "season": lg.get("season"),
+            "status": lg.get("status"),
+            "num_teams": lg.get("total_rosters"),
+            "avatar": lg.get("avatar"),
+        })
+
+    result = {"leagues": results, "user_id": user_id, "username": username}
+    _sleeper_cache[cache_key] = result
+    _sleeper_cache[f"{cache_key}_ts"] = time.time()
+    return result
+
+
+@app.get("/api/sleeper/league/{league_id}")
+def get_sleeper_league(league_id: str, username: str = ""):
+    """Full league data: standings + enriched rosters with stats/dynasty values/ML predictions."""
+    import time, httpx
+
+    cache_key = f"league_{league_id}"
+    if _sleeper_cache.get(cache_key) and time.time() - _sleeper_cache.get(f"{cache_key}_ts", 0) < 3600:
+        cached = _sleeper_cache[cache_key]
+        # Re-flag is_me if username provided
+        if username:
+            _flag_is_me(cached, username)
+        return cached
+
+    try:
+        with httpx.Client(timeout=15) as client:
+            league_r  = client.get(f"https://api.sleeper.app/v1/league/{league_id}")
+            rosters_r = client.get(f"https://api.sleeper.app/v1/league/{league_id}/rosters")
+            users_r   = client.get(f"https://api.sleeper.app/v1/league/{league_id}/users")
+            players_r = client.get("https://api.sleeper.app/v1/players/nfl")
+
+        league_data = league_r.json()
+        rosters     = rosters_r.json()
+        users       = users_r.json()
+        all_players = players_r.json()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Sleeper API unavailable: {e}")
+
+    user_map = {
+        u["user_id"]: {
+            "name": u["display_name"],
+            "avatar": u.get("metadata", {}).get("avatar") or u.get("avatar"),
+            "username": u.get("display_name", "").lower(),
+        }
+        for u in users
+    }
+    # Build username → user_id map for is_me detection
+    username_to_uid = {u["display_name"].lower(): u["user_id"] for u in users}
+
+    data = load_data()
+    players_df = data["players"]
+    stat_map = {str(r["player_id"]): dict(r) for _, r in players_df.iterrows()}
+
+    pred_map, pred_name_map = _load_pred_maps()
+    dynasty_name_map = _load_dynasty_map()
+
+    resolve_player = _make_resolve_player(all_players, players_df, stat_map, pred_map, pred_name_map, dynasty_name_map)
 
     standings = []
     for r in rosters:
         owner_id = r.get("owner_id", "")
-        user_info = user_map.get(owner_id, {"name": "Unknown", "avatar": None})
+        user_info = user_map.get(owner_id, {"name": "Unknown", "avatar": None, "username": ""})
         s = r.get("settings", {})
         players_resolved = [resolve_player(pid) for pid in (r.get("players") or [])]
         taxi_resolved    = [resolve_player(pid) for pid in (r.get("taxi") or [])]
@@ -1434,10 +1512,9 @@ def get_sleeper_league():
             "ties": s.get("ties", 0),
             "fpts": round((s.get("fpts", 0) or 0) + (s.get("fpts_decimal", 0) or 0) / 100, 2),
             "fpts_against": round((s.get("fpts_against", 0) or 0) + (s.get("fpts_against_decimal", 0) or 0) / 100, 2),
-            "waiver_budget_used": s.get("waiver_budget_used", 0),
             "players": players_resolved,
             "taxi": taxi_resolved,
-            "is_me": owner_id == SLEEPER_USER_ID,
+            "is_me": False,  # will be set below
         })
 
     standings.sort(key=lambda x: (-x["wins"], -x["fpts"]))
@@ -1447,23 +1524,133 @@ def get_sleeper_league():
         "season": league_data.get("season"),
         "num_teams": league_data.get("total_rosters"),
         "status": league_data.get("status"),
-        "playoff_week_start": league_data.get("settings", {}).get("playoff_week_start"),
         "standings": standings,
+        "_username_to_uid": username_to_uid,
     }
+
+    if username:
+        _flag_is_me(result, username)
 
     _sleeper_cache[cache_key] = result
     _sleeper_cache[f"{cache_key}_ts"] = time.time()
     return result
 
 
+def _flag_is_me(league_result: dict, username: str):
+    """Set is_me=True on the roster belonging to username."""
+    uid_map = league_result.get("_username_to_uid", {})
+    my_uid = uid_map.get(username.lower())
+    for team in league_result.get("standings", []):
+        team["is_me"] = (team["owner_id"] == my_uid) if my_uid else False
+
+
 @app.get("/api/sleeper/my-team")
 def get_my_team():
-    """Just Harvin's roster from Dynasty Men."""
-    league = get_sleeper_league()
+    """Legacy endpoint — Harvin's roster from 2026 Dynasty Men."""
+    league = get_sleeper_league("1312156205287747584", username="HarvinB")
     my_roster = next((s for s in league["standings"] if s["is_me"]), None)
     if not my_roster:
         raise HTTPException(status_code=404, detail="Roster not found")
     return {**my_roster, "league_name": league["league_name"], "season": league["season"]}
+
+
+@app.get("/api/dynasty/positional-rankings")
+def get_dynasty_positional_rankings(position: str = "ALL"):
+    """
+    Dynasty positional rankings: merge FantasyCalc values + our stats + ML predictions.
+    Sorted by dynasty_value descending.
+    """
+    import time
+
+    cache_key = f"pos_rankings_{position}"
+    if _sleeper_cache.get(cache_key) and time.time() - _sleeper_cache.get(f"{cache_key}_ts", 0) < 3600:
+        return _sleeper_cache[cache_key]
+
+    dyn_data = get_dynasty_adp()
+    dyn_players = dyn_data["players"]
+
+    data = load_data()
+    players_df = data["players"]
+    stat_map = {str(r["player_id"]): dict(r) for _, r in players_df.iterrows()}
+    name_stat_map = {_norm(r["player_display_name"]): dict(r) for _, r in players_df.iterrows() if r.get("player_display_name")}
+
+    pred_map, pred_name_map = _load_pred_maps()
+
+    TIERS = [
+        (8000, "Elite"),
+        (6000, "S-Tier"),
+        (4000, "A-Tier"),
+        (2000, "B-Tier"),
+        (1000, "C-Tier"),
+        (0,    "D-Tier"),
+    ]
+
+    def dynasty_tier(value):
+        if value is None:
+            return "D-Tier"
+        for threshold, label in TIERS:
+            if value >= threshold:
+                return label
+        return "D-Tier"
+
+    VALID_POSITIONS = {"QB", "WR", "RB", "TE"}
+
+    results = []
+    for i, dp in enumerate(dyn_players):
+        pos = dp.get("position", "")
+        if pos not in VALID_POSITIONS:
+            continue
+        if position != "ALL" and pos != position:
+            continue
+
+        name = dp.get("name", "")
+        pid  = dp.get("player_id") or ""
+        dval = dp.get("dynasty_value")
+
+        # Stat lookup
+        stats = stat_map.get(pid) or name_stat_map.get(_norm(name), {})
+        ppg = None
+        weighted_ppg = None
+        if stats:
+            fpts = stats.get("fantasy_points_ppr")
+            g    = stats.get("games") or 0
+            if fpts and g:
+                ppg = round(float(fpts) / float(g), 1)
+                weighted_ppg = round(ppg * (g / 17), 1)
+
+        pred = pred_map.get(pid) or pred_name_map.get(_norm(name), {})
+
+        results.append({
+            "player_id": pid,
+            "name": name,
+            "position": pos,
+            "team": dp.get("team"),
+            "age": dp.get("age"),
+            "dynasty_rank": dp.get("dynasty_rank"),
+            "dynasty_pos_rank": dp.get("dynasty_pos_rank"),
+            "dynasty_value": dval,
+            "dynasty_tier": dynasty_tier(dval),
+            "dynasty_trend": dp.get("dynasty_trend"),
+            "ppg_2025": ppg,
+            "weighted_ppg_2025": weighted_ppg,
+            "predicted_value_score_2026": pred.get("predicted_value_score"),
+            "is_top_dog": pred.get("is_top_dog"),
+            "headshot_url": stats.get("headshot_url") if stats else None,
+        })
+
+    results.sort(key=lambda x: (x["dynasty_value"] or 0), reverse=True)
+
+    # Add positional rank within results
+    pos_counters: dict = {}
+    for r in results:
+        p = r["position"]
+        pos_counters[p] = pos_counters.get(p, 0) + 1
+        r["dynasty_pos_rank"] = pos_counters[p]
+
+    result = {"players": results, "count": len(results)}
+    _sleeper_cache[cache_key] = result
+    _sleeper_cache[f"{cache_key}_ts"] = time.time()
+    return result
 
 
 # ── Static files (React build) ───────────────────────────────────────────────
