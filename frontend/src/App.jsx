@@ -5,6 +5,7 @@ import LeaderboardTab from './components/LeaderboardTab'
 import FantasyTab from './components/FantasyTab'
 import CompareTab from './components/CompareTab'
 import DynastyTab from './components/DynastyTab'
+import MyTeamTab from './components/MyTeamTab'
 import './index.css'
 
 const TABS = [
@@ -13,6 +14,7 @@ const TABS = [
   { id: 'fantasy',      label: 'Fantasy' },
   { id: 'dynasty',      label: 'Dynasty' },
   { id: 'compare',      label: 'Compare' },
+  { id: 'myteam',       label: 'Dynasty Men' },
 ]
 
 export default function App() {
@@ -45,6 +47,7 @@ export default function App() {
         {tab === 'fantasy'      && <FantasyTab />}
         {tab === 'dynasty'      && <DynastyTab />}
         {tab === 'compare'      && <CompareTab players={players} />}
+        {tab === 'myteam'       && <MyTeamTab />}
       </main>
     </div>
   )

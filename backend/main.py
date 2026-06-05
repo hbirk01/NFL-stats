@@ -1315,6 +1315,157 @@ def get_value_picks_predictions(position: str = None):
     }
 
 
+# ── Sleeper League Integration ───────────────────────────────────────────────
+
+SLEEPER_USER_ID = "986073473632010240"
+SLEEPER_LEAGUE_ID = "1180308902364819456"
+_sleeper_cache: dict = {}
+
+@app.get("/api/sleeper/league")
+def get_sleeper_league():
+    """Dynasty Men league overview: standings, all rosters, scoring."""
+    import time, httpx
+
+    cache_key = "league"
+    if _sleeper_cache.get(cache_key) and time.time() - _sleeper_cache.get(f"{cache_key}_ts", 0) < 3600:
+        return _sleeper_cache[cache_key]
+
+    try:
+        with httpx.Client(timeout=10) as client:
+            league_r   = client.get(f"https://api.sleeper.app/v1/league/{SLEEPER_LEAGUE_ID}")
+            rosters_r  = client.get(f"https://api.sleeper.app/v1/league/{SLEEPER_LEAGUE_ID}/rosters")
+            users_r    = client.get(f"https://api.sleeper.app/v1/league/{SLEEPER_LEAGUE_ID}/users")
+            players_r  = client.get("https://api.sleeper.app/v1/players/nfl")
+
+        league_data = league_r.json()
+        rosters     = rosters_r.json()
+        users       = users_r.json()
+        all_players = players_r.json()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Sleeper API unavailable: {e}")
+
+    user_map = {u["user_id"]: {"name": u["display_name"], "avatar": u.get("metadata", {}).get("avatar") or u.get("avatar")} for u in users}
+
+    # Load our stat data for cross-referencing
+    data = load_data()
+    players_df = data["players"]
+    stat_map = {r["player_id"]: r for _, r in players_df.iterrows()}
+
+    # Load 2026 predictions
+    pred_map = {}
+    try:
+        import json as _json, os as _os
+        pred_file = _os.path.join(_os.path.dirname(__file__), "ml", "predictions_2026.json")
+        with open(pred_file) as f:
+            preds = _json.load(f)["players"]
+        pred_map = {p["player_id"]: p for p in preds if p.get("player_id")}
+        # Also index by name norm for fallback
+        def _norm(n): return (n or "").lower().replace("'","").replace(".","").replace("-","").replace(" ","")
+        pred_name_map = {_norm(p["name"]): p for p in preds}
+    except Exception:
+        pred_name_map = {}
+
+    def resolve_player(sleeper_id: str):
+        sp = all_players.get(sleeper_id, {})
+        name = sp.get("full_name") or sp.get("search_full_name", "")
+        pos  = sp.get("position", "")
+        team = sp.get("team", "")
+        gsis = sp.get("gsis_id") or ""
+
+        # Match to our stats via gsis_id or name — always resolve to a plain dict
+        stats = stat_map.get(gsis)
+        if stats is None and name:
+            norm_name = _norm(name)
+            match = next((r for _, r in players_df.iterrows() if _norm(r.get("player_display_name","")) == norm_name), None)
+            stats = dict(match) if match is not None else {}
+        elif stats is not None:
+            stats = dict(stats)
+        else:
+            stats = {}
+
+        pred = pred_map.get(gsis) or pred_name_map.get(_norm(name), {})
+
+        ppg = None
+        weighted_ppg = None
+        games = None
+        if stats:
+            fpts = stats.get("fantasy_points_ppr")
+            g    = stats.get("games") or 0
+            if fpts and g:
+                ppg = round(float(fpts) / float(g), 1)
+                weighted_ppg = round(ppg * (g / 17), 1)
+            games = int(g)
+
+        return {
+            "sleeper_id": sleeper_id,
+            "player_id": gsis,
+            "name": name or sleeper_id,
+            "position": pos,
+            "team": team,
+            "age": sp.get("age"),
+            "years_exp": sp.get("years_exp"),
+            "headshot_url": f"https://sleepercdn.com/content/nfl/players/thumb/{sleeper_id}.jpg",
+            # 2025 actual stats
+            "ppg_2025": ppg,
+            "weighted_ppg_2025": weighted_ppg,
+            "games_2025": games,
+            "fantasy_points_2025": round(float(stats.get("fantasy_points_ppr", 0) or 0), 1) if stats else None,
+            # 2026 ML prediction
+            "predicted_value_score_2026": pred.get("predicted_value_score"),
+            "is_top_dog": pred.get("is_top_dog"),
+            "adp_gap_to_teammate": pred.get("adp_gap_to_teammate"),
+        }
+
+    standings = []
+    for r in rosters:
+        owner_id = r.get("owner_id", "")
+        user_info = user_map.get(owner_id, {"name": "Unknown", "avatar": None})
+        s = r.get("settings", {})
+        players_resolved = [resolve_player(pid) for pid in (r.get("players") or [])]
+        taxi_resolved    = [resolve_player(pid) for pid in (r.get("taxi") or [])]
+
+        standings.append({
+            "roster_id": r["roster_id"],
+            "owner_id": owner_id,
+            "display_name": user_info["name"],
+            "avatar": user_info["avatar"],
+            "wins": s.get("wins", 0),
+            "losses": s.get("losses", 0),
+            "ties": s.get("ties", 0),
+            "fpts": round((s.get("fpts", 0) or 0) + (s.get("fpts_decimal", 0) or 0) / 100, 2),
+            "fpts_against": round((s.get("fpts_against", 0) or 0) + (s.get("fpts_against_decimal", 0) or 0) / 100, 2),
+            "waiver_budget_used": s.get("waiver_budget_used", 0),
+            "players": players_resolved,
+            "taxi": taxi_resolved,
+            "is_me": owner_id == SLEEPER_USER_ID,
+        })
+
+    standings.sort(key=lambda x: (-x["wins"], -x["fpts"]))
+
+    result = {
+        "league_name": league_data.get("name"),
+        "season": league_data.get("season"),
+        "num_teams": league_data.get("total_rosters"),
+        "status": league_data.get("status"),
+        "playoff_week_start": league_data.get("settings", {}).get("playoff_week_start"),
+        "standings": standings,
+    }
+
+    _sleeper_cache[cache_key] = result
+    _sleeper_cache[f"{cache_key}_ts"] = time.time()
+    return result
+
+
+@app.get("/api/sleeper/my-team")
+def get_my_team():
+    """Just Harvin's roster from Dynasty Men."""
+    league = get_sleeper_league()
+    my_roster = next((s for s in league["standings"] if s["is_me"]), None)
+    if not my_roster:
+        raise HTTPException(status_code=404, detail="Roster not found")
+    return {**my_roster, "league_name": league["league_name"], "season": league["season"]}
+
+
 # ── Static files (React build) ───────────────────────────────────────────────
 DIST = os.path.join(os.path.dirname(__file__), "..", "frontend", "dist")
 if os.path.isdir(DIST):
