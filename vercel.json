@@ -1,0 +1,10 @@
+{
+  "buildCommand": "cd frontend && npm install && npm run build",
+  "outputDirectory": "frontend/dist",
+  "rewrites": [
+    {
+      "source": "/api/:path*",
+      "destination": "https://nfl-stats-nmg0.onrender.com/api/:path*"
+    }
+  ]
+}
