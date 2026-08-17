@@ -5,3 +5,6 @@ anthropic
 pandas
 httpx
 beautifulsoup4
+scikit-learn
+xgboost
+matplotlib

@@ -148,7 +148,7 @@ function MyLeaguesView() {
   const [selectedLeague, setSelectedLeague] = useState(null)
   const [leagueData, setLeagueData] = useState(null)
   const [leagueLoading, setLeagueLoading] = useState(false)
-  const [subTab, setSubTab] = useState('roster') // 'roster' | 'standings'
+  const [subTab, setSubTab] = useState('roster') // 'roster' | 'standings' | 'power'
 
   // Fetch leagues when username changes
   useEffect(() => {
@@ -385,7 +385,10 @@ function LeagueDetail({ league, selectedLeague, username, subTab, setSubTab, onB
           ← Back
         </button>
         <div>
-          <div style={{ fontWeight: 700, fontSize: 16 }}>{league.league_name}</div>
+          <div style={{ fontWeight: 700, fontSize: 16, display: 'flex', alignItems: 'center', gap: 8 }}>
+            {league.league_name}
+            {league.is_superflex && <span style={{ fontSize: 11, fontWeight: 700, background: '#a78bfa33', color: '#a78bfa', borderRadius: 4, padding: '1px 7px' }}>SUPERFLEX</span>}
+          </div>
           <div style={{ fontSize: 12, color: 'var(--muted)' }}>Season {league.season} · {league.num_teams} teams · {league.status}</div>
         </div>
         {myTeam && (
@@ -398,9 +401,9 @@ function LeagueDetail({ league, selectedLeague, username, subTab, setSubTab, onB
 
       {/* Sub-tabs */}
       <div style={{ display: 'flex', gap: 4, marginBottom: 20, background: 'var(--surface2)', borderRadius: 8, padding: 4, width: 'fit-content', border: '1px solid var(--border)' }}>
-        {['roster', 'needs', 'standings'].map(t => (
-          <button key={t} onClick={() => setSubTab(t)} style={{ background: subTab === t ? 'var(--accent)' : 'none', border: 'none', color: subTab === t ? '#fff' : 'var(--muted)', padding: '5px 16px', fontSize: 13, fontWeight: 600, cursor: 'pointer', borderRadius: 6, textTransform: 'capitalize' }}>
-            {t === 'roster' ? 'My Roster' : t === 'needs' ? 'Needs Analysis' : 'Standings'}
+        {[['roster','My Roster'],['needs','Needs Analysis'],['standings','Standings'],['power','Power Rankings'],['tips','Trade Tips']].map(([t, label]) => (
+          <button key={t} onClick={() => setSubTab(t)} style={{ background: subTab === t ? 'var(--accent)' : 'none', border: 'none', color: subTab === t ? '#fff' : 'var(--muted)', padding: '5px 16px', fontSize: 13, fontWeight: 600, cursor: 'pointer', borderRadius: 6 }}>
+            {label}
           </button>
         ))}
       </div>
@@ -413,6 +416,8 @@ function LeagueDetail({ league, selectedLeague, username, subTab, setSubTab, onB
       )}
       {subTab === 'needs' && <NeedsAnalysis myTeam={myTeam} standings={league.standings} />}
       {subTab === 'standings' && <StandingsView standings={league.standings} myTeam={myTeam} />}
+      {subTab === 'power' && <PowerRankingsView leagueId={selectedLeague.league_id} standings={league.standings} />}
+      {subTab === 'tips' && <TradeRecommendationsView myTeam={myTeam} standings={league.standings} />}
     </div>
   )
 }
@@ -497,6 +502,585 @@ function PlayerRosterCard({ player, posColor }) {
   )
 }
 
+// ─── Trade Recommendations ────────────────────────────────────────────────────
+
+function detectTeamMode(myTeam, standings) {
+  const myPlayers = (myTeam.players || []).filter(p => (p.dynasty_value || 0) > 500)
+  const top8 = [...myPlayers].sort((a, b) => (b.dynasty_value || 0) - (a.dynasty_value || 0)).slice(0, 8)
+
+  const agesArr = top8.map(p => p.age).filter(Boolean)
+  const avgAge = agesArr.length ? agesArr.reduce((s, a) => s + a, 0) / agesArr.length : 25
+
+  const totalGames = (myTeam.wins || 0) + (myTeam.losses || 0)
+  const winPct = totalGames > 0 ? myTeam.wins / totalGames : 0.5
+
+  if (avgAge >= 27.5 || winPct < 0.33) return 'rebuild'
+  if (winPct >= 0.6 && avgAge <= 26.5) return 'contend'
+  return 'balanced'
+}
+
+function computePositionalNeeds(myTeam, standings) {
+  const positions = ['QB', 'WR', 'RB', 'TE']
+  const leagueAvg = {}
+  for (const pos of positions) {
+    const totals = standings.map(t =>
+      (t.players || []).filter(p => p.position === pos).reduce((s, p) => s + (p.dynasty_value || 0), 0)
+    )
+    leagueAvg[pos] = totals.reduce((s, v) => s + v, 0) / Math.max(totals.length, 1)
+  }
+  const myTotals = {}
+  for (const pos of positions) {
+    myTotals[pos] = (myTeam.players || []).filter(p => p.position === pos).reduce((s, p) => s + (p.dynasty_value || 0), 0)
+  }
+  // Return positions sorted worst (biggest deficit) first
+  return positions
+    .map(pos => ({ pos, gap: myTotals[pos] - leagueAvg[pos] }))
+    .sort((a, b) => a.gap - b.gap)
+}
+
+function generateRecommendations(myTeam, standings, mode) {
+  const myPlayers = (myTeam.players || []).filter(p => (p.dynasty_value || 0) > 500)
+  const otherTeams = standings.filter(s => s.roster_id !== myTeam.roster_id)
+  const needs = computePositionalNeeds(myTeam, standings)
+  const weakPositions = needs.slice(0, 2).map(n => n.pos) // top 2 weakest positions
+
+  const recs = []
+
+  if (mode === 'rebuild') {
+    // Sell: aging producers (age >= 27, decent PPG, still has value)
+    // Buy: young assets (age <= 24) of similar dynasty value
+    const sellPool = myPlayers
+      .filter(p => (p.age || 0) >= 27 && (p.ppg_2025 || 0) >= 7 && (p.dynasty_value || 0) >= 1500)
+      .sort((a, b) => (b.dynasty_value || 0) - (a.dynasty_value || 0))
+
+    for (const sell of sellPool.slice(0, 8)) {
+      const base = sell.dynasty_value || 0
+      const lo = base * 0.50
+      const hi = base * 1.60
+      for (const team of otherTeams) {
+        const buyPool = (team.players || []).filter(p =>
+          (p.age || 30) <= 25 &&
+          (p.dynasty_value || 0) >= lo &&
+          (p.dynasty_value || 0) <= hi &&
+          p.position !== 'K' && p.position !== 'DEF'
+        )
+        for (const buy of buyPool) {
+          const isNeedPos = weakPositions.includes(buy.position)
+          recs.push({
+            give: sell,
+            get: buy,
+            team: team.display_name || team.team_name || 'Opponent',
+            mode: 'rebuild',
+            valueSwing: (buy.dynasty_value || 0) - (sell.dynasty_value || 0),
+            ageSwing: (sell.age || 0) - (buy.age || 0),
+            ppgSwing: (sell.ppg_2025 || 0) - (buy.ppg_2025 || 0),
+            isNeedPos,
+            score: (isNeedPos ? 2000 : 0) + ((sell.age || 0) - (buy.age || 0)) * 100 + ((sell.dynasty_value || 0) - (buy.dynasty_value || 0)) * 0.5
+          })
+        }
+      }
+    }
+  } else if (mode === 'contend') {
+    // Sell: young stashes (high dynasty value, low PPG) — any age but producing below their value
+    const sellPool = myPlayers
+      .filter(p => (p.dynasty_value || 0) >= 1500 && (p.ppg_2025 || 0) <= 10 && (p.age || 30) <= 25)
+      .sort((a, b) => (b.dynasty_value || 0) - (a.dynasty_value || 0))
+
+    for (const sell of sellPool.slice(0, 8)) {
+      const base = sell.dynasty_value || 0
+      const lo = base * 0.50
+      const hi = base * 1.55
+      for (const team of otherTeams) {
+        const buyPool = (team.players || []).filter(p =>
+          (p.ppg_2025 || 0) >= 9 &&
+          (p.dynasty_value || 0) >= lo &&
+          (p.dynasty_value || 0) <= hi
+        )
+        for (const buy of buyPool) {
+          const isNeedPos = weakPositions.includes(buy.position)
+          recs.push({
+            give: sell,
+            get: buy,
+            team: team.display_name || team.team_name || 'Opponent',
+            mode: 'contend',
+            valueSwing: (buy.dynasty_value || 0) - (sell.dynasty_value || 0),
+            ageSwing: (sell.age || 0) - (buy.age || 0),
+            ppgSwing: (buy.ppg_2025 || 0) - (sell.ppg_2025 || 0),
+            isNeedPos,
+            score: (isNeedPos ? 2000 : 0) + ((buy.ppg_2025 || 0) - (sell.ppg_2025 || 0)) * 200 + ((sell.dynasty_value || 0) - (buy.dynasty_value || 0)) * 0.3
+          })
+        }
+      }
+    }
+  } else {
+    // Balanced: trade surplus-position players for need-position players.
+    // Value matching: within ±40% OR within 2500 absolute — whichever is more lenient.
+    // For the biggest need (gap > 3000), also widen further to cover superflex QB gaps.
+    const surplusPositions = needs.filter(n => n.gap > 200).map(n => n.pos)
+    const positionsToSellFrom = surplusPositions.length > 0 ? surplusPositions : needs.slice(-2).map(n => n.pos)
+    const bigNeedPositions = needs.filter(n => n.gap < -2000).map(n => n.pos)
+
+    // Build flat sell pool: all players at surplus positions (keep starter + depth)
+    const sellPool = myPlayers
+      .filter(p => positionsToSellFrom.includes(p.position) && (p.dynasty_value || 0) >= 800)
+      .sort((a, b) => (b.dynasty_value || 0) - (a.dynasty_value || 0))
+
+    // Build flat buy pool across all need positions and all other teams
+    const allBuyCandidates = []
+    for (const needPos of weakPositions) {
+      for (const team of otherTeams) {
+        for (const p of (team.players || [])) {
+          if (p.position === needPos && (p.dynasty_value || 0) >= 500) {
+            allBuyCandidates.push({ ...p, _team: team })
+          }
+        }
+      }
+    }
+    for (const sell of sellPool.slice(0, 8)) {
+      const base = sell.dynasty_value || 0
+      const isBigNeed = bigNeedPositions.length > 0
+
+      for (const buy of allBuyCandidates) {
+        const bval = buy.dynasty_value || 0
+        const pctLo = isBigNeed ? base * 0.35 : base * 0.50
+        const pctHi = isBigNeed ? base * 1.80 : base * 1.60
+        const absOk  = Math.abs(bval - base) <= (isBigNeed ? 3500 : 2000)
+        if (!((bval >= pctLo && bval <= pctHi) || absOk)) continue
+
+        const posGapBonus = Math.abs(needs.find(n => n.pos === buy.position)?.gap || 0)
+        // Penalise large value imbalance so fair trades rank above lopsided ones
+        const valuePenalty = Math.abs(bval - base) * 0.15
+        recs.push({
+          give: sell,
+          get: buy,
+          team: buy._team.display_name || buy._team.team_name || 'Opponent',
+          mode: 'balanced',
+          valueSwing: bval - base,
+          ageSwing: (sell.age || 0) - (buy.age || 0),
+          ppgSwing: (buy.ppg_2025 || 0) - (sell.ppg_2025 || 0),
+          isNeedPos: true,
+          score: 2000 + posGapBonus * 0.25 - valuePenalty
+        })
+      }
+    }
+  }
+
+  // Dedupe (give+get pair), limit same-giver to 3 results for variety, sort by score
+  const seen = new Set()
+  const giverCount = {}
+  return recs
+    .sort((a, b) => b.score - a.score)
+    .filter(r => {
+      const giveKey = r.give.name || r.give.player_id || r.give.sleeper_id
+      const getKey  = r.get.name  || r.get.player_id  || r.get.sleeper_id
+      const key = `${giveKey}-${getKey}`
+      if (seen.has(key)) return false
+      seen.add(key)
+      const gc = giverCount[giveKey] || 0
+      if (gc >= 3) return false
+      giverCount[giveKey] = gc + 1
+      return true
+    })
+    .slice(0, 15)
+}
+
+const MODE_META = {
+  rebuild: { label: 'Rebuilding', color: '#f59e0b', bg: '#f59e0b22', tip: 'Sell aging vets for young dynasty assets. Trade PPG now for value later.' },
+  contend: { label: 'Contending', color: '#22c55e', bg: '#22c55e22', tip: 'Sell dynasty stashes for proven producers. Win now while your window is open.' },
+  balanced: { label: 'Balanced', color: '#3b82f6', bg: '#3b82f622', tip: 'Trade positional depth for positional need. Stay competitive while improving your roster.' },
+}
+
+const POS_COLOR = { QB: '#a78bfa', WR: '#60a5fa', RB: '#34d399', TE: '#fb923c' }
+
+function TradeRecommendationsView({ myTeam, standings }) {
+  const [selectedTeam, setSelectedTeam] = useState(myTeam || standings?.[0] || null)
+
+  if (!standings?.length) {
+    return <div style={{ color: 'var(--muted)', padding: 40, textAlign: 'center' }}>No league data available.</div>
+  }
+
+  const team = selectedTeam || myTeam || standings[0]
+  const otherTeams = standings.filter(s => s.roster_id !== team.roster_id)
+
+  const mode = detectTeamMode(team, standings)
+  const meta = MODE_META[mode]
+  const recs = generateRecommendations(team, standings, mode)
+  const needs = computePositionalNeeds(team, standings)
+
+  const posTag = pos => (
+    <span style={{ background: (POS_COLOR[pos] || '#888') + '33', color: POS_COLOR[pos] || '#888', borderRadius: 4, padding: '1px 6px', fontSize: 11, fontWeight: 700 }}>{pos}</span>
+  )
+
+  const valBadge = (v, label) => {
+    const positive = v > 0
+    return (
+      <span style={{ color: positive ? '#22c55e' : '#ef4444', fontSize: 11, fontWeight: 600 }}>
+        {positive ? '+' : ''}{label}
+      </span>
+    )
+  }
+
+  return (
+    <div>
+      {/* Team picker */}
+      <div style={{ display: 'flex', gap: 6, marginBottom: 16, overflowX: 'auto', paddingBottom: 4 }}>
+        {standings.map(t => {
+          const isSelected = t.roster_id === team.roster_id
+          const isMe = t.is_me
+          return (
+            <button
+              key={t.roster_id}
+              onClick={() => setSelectedTeam(t)}
+              style={{
+                flexShrink: 0, padding: '5px 14px', borderRadius: 20, cursor: 'pointer',
+                border: `1px solid ${isSelected ? 'var(--accent)' : 'var(--border)'}`,
+                background: isSelected ? 'var(--accent)22' : 'transparent',
+                color: isSelected ? 'var(--accent)' : 'var(--muted)',
+                fontWeight: isSelected ? 700 : 500, fontSize: 12,
+                outline: isMe ? `1px solid var(--accent)44` : 'none',
+              }}
+            >
+              {t.display_name || t.team_name || `Team ${t.roster_id}`}
+              {isMe && <span style={{ fontSize: 10, marginLeft: 4, opacity: 0.7 }}>you</span>}
+            </button>
+          )
+        })}
+      </div>
+      {/* Mode banner */}
+      <div style={{ background: meta.bg, border: `1px solid ${meta.color}44`, borderRadius: 10, padding: '14px 18px', marginBottom: 20, display: 'flex', alignItems: 'center', gap: 14 }}>
+        <div style={{ background: meta.color, borderRadius: 6, padding: '4px 12px', color: '#000', fontWeight: 800, fontSize: 13 }}>{meta.label}</div>
+        <div style={{ flex: 1 }}>
+          <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 2 }}>
+            {team.display_name || team.team_name}
+            {team.is_me && <span style={{ fontSize: 11, color: 'var(--accent)', marginLeft: 6 }}>you</span>}
+          </div>
+          <div style={{ fontSize: 12, color: 'var(--muted)' }}>{meta.tip}</div>
+        </div>
+        <div style={{ fontSize: 12, color: 'var(--muted)', textAlign: 'right' }}>
+          <div>{team.wins}-{team.losses} · {(team.wins / Math.max((team.wins + team.losses), 1) * 100).toFixed(0)}% win rate</div>
+        </div>
+      </div>
+
+      {/* Positional heat map */}
+      <div style={{ display: 'flex', gap: 8, marginBottom: 20 }}>
+        {needs.map(({ pos, gap }) => {
+          const isWeak = gap < -500
+          const isStrong = gap > 500
+          return (
+            <div key={pos} style={{ flex: 1, background: isWeak ? '#ef444422' : isStrong ? '#22c55e22' : 'var(--surface2)', border: `1px solid ${isWeak ? '#ef4444' : isStrong ? '#22c55e' : 'var(--border)'}44`, borderRadius: 8, padding: '10px 12px', textAlign: 'center' }}>
+              <div style={{ fontSize: 12, fontWeight: 700, color: POS_COLOR[pos] || '#888', marginBottom: 4 }}>{pos}</div>
+              <div style={{ fontSize: 11, color: isWeak ? '#ef4444' : isStrong ? '#22c55e' : 'var(--muted)', fontWeight: 600 }}>
+                {isWeak ? 'Need' : isStrong ? 'Surplus' : 'Average'}
+              </div>
+              <div style={{ fontSize: 10, color: 'var(--muted)', marginTop: 2 }}>
+                {gap > 0 ? '+' : ''}{Math.round(gap / 100) * 100}
+              </div>
+            </div>
+          )
+        })}
+      </div>
+
+      {/* Trade cards */}
+      {recs.length === 0 ? (
+        <div style={{ color: 'var(--muted)', textAlign: 'center', padding: 40 }}>
+          No trade matches found. Your roster may already be well-balanced for your mode.
+        </div>
+      ) : (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+          {recs.map((rec, i) => (
+            <div key={i} style={{ background: 'var(--surface2)', border: `1px solid ${rec.isNeedPos ? '#3b82f644' : 'var(--border)'}`, borderLeft: `3px solid ${rec.isNeedPos ? '#3b82f6' : meta.color}`, borderRadius: 10, padding: '14px 16px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 0, marginBottom: 10 }}>
+                {/* Give */}
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: 10, color: 'var(--muted)', fontWeight: 600, marginBottom: 4, textTransform: 'uppercase', letterSpacing: '0.05em' }}>You Give</div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    {rec.give.headshot_url && <img src={rec.give.headshot_url} style={{ width: 36, height: 36, borderRadius: '50%', objectFit: 'cover', background: 'var(--surface)' }} alt="" />}
+                    <div>
+                      <div style={{ fontWeight: 700, fontSize: 14 }}>{rec.give.name}</div>
+                      <div style={{ display: 'flex', gap: 4, alignItems: 'center', marginTop: 2 }}>
+                        {posTag(rec.give.position)}
+                        <span style={{ fontSize: 11, color: 'var(--muted)' }}>Age {rec.give.age?.toFixed(0) || '?'}</span>
+                        {rec.give.ppg_2025 != null && <span style={{ fontSize: 11, color: 'var(--muted)' }}>{rec.give.ppg_2025} PPG</span>}
+                      </div>
+                      <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 1 }}>{(rec.give.dynasty_value || 0).toLocaleString()} value</div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Arrow */}
+                <div style={{ padding: '0 16px', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 2 }}>
+                  <div style={{ fontSize: 20, color: 'var(--muted)' }}>⇄</div>
+                  <div style={{ fontSize: 10, color: 'var(--muted)', textAlign: 'center', maxWidth: 80 }}>w/ {rec.team}</div>
+                </div>
+
+                {/* Get */}
+                <div style={{ flex: 1, textAlign: 'right' }}>
+                  <div style={{ fontSize: 10, color: 'var(--muted)', fontWeight: 600, marginBottom: 4, textTransform: 'uppercase', letterSpacing: '0.05em' }}>You Get</div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, justifyContent: 'flex-end' }}>
+                    <div>
+                      <div style={{ fontWeight: 700, fontSize: 14 }}>{rec.get.name}</div>
+                      <div style={{ display: 'flex', gap: 4, alignItems: 'center', justifyContent: 'flex-end', marginTop: 2 }}>
+                        {rec.get.ppg_2025 != null && <span style={{ fontSize: 11, color: 'var(--muted)' }}>{rec.get.ppg_2025} PPG</span>}
+                        <span style={{ fontSize: 11, color: 'var(--muted)' }}>Age {rec.get.age?.toFixed(0) || '?'}</span>
+                        {posTag(rec.get.position)}
+                      </div>
+                      <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 1 }}>{(rec.get.dynasty_value || 0).toLocaleString()} value</div>
+                    </div>
+                    {rec.get.headshot_url && <img src={rec.get.headshot_url} style={{ width: 36, height: 36, borderRadius: '50%', objectFit: 'cover', background: 'var(--surface)' }} alt="" />}
+                  </div>
+                </div>
+              </div>
+
+              {/* Deltas row */}
+              <div style={{ display: 'flex', gap: 16, paddingTop: 8, borderTop: '1px solid var(--border)', flexWrap: 'wrap' }}>
+                <div style={{ fontSize: 11 }}>
+                  <span style={{ color: 'var(--muted)' }}>Value: </span>
+                  {valBadge(rec.valueSwing, `${rec.valueSwing > 0 ? '+' : ''}${rec.valueSwing.toLocaleString()}`)}
+                </div>
+                {rec.ageSwing !== 0 && (
+                  <div style={{ fontSize: 11 }}>
+                    <span style={{ color: 'var(--muted)' }}>Age swing: </span>
+                    {valBadge(mode === 'rebuild' ? rec.ageSwing : -rec.ageSwing, `${rec.ageSwing > 0 ? '-' : '+'}${Math.abs(rec.ageSwing).toFixed(0)} yrs younger`)}
+                  </div>
+                )}
+                {rec.ppgSwing !== 0 && (
+                  <div style={{ fontSize: 11 }}>
+                    <span style={{ color: 'var(--muted)' }}>PPG swing: </span>
+                    {valBadge(mode === 'rebuild' ? -rec.ppgSwing : rec.ppgSwing, `${rec.ppgSwing > 0 ? '+' : ''}${rec.ppgSwing.toFixed(1)} PPG`)}
+                  </div>
+                )}
+                {rec.isNeedPos && (
+                  <div style={{ fontSize: 11, color: '#3b82f6', fontWeight: 600 }}>Fills positional need</div>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ─── Power Rankings ───────────────────────────────────────────────────────────
+
+function PowerRankingsView({ leagueId, standings }) {
+  const [data, setData] = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState(null)
+  const [highlight, setHighlight] = useState(null) // roster_id to show sparkline detail
+
+  useEffect(() => {
+    setLoading(true)
+    fetch(`/api/sleeper/league/${leagueId}/power-rankings`)
+      .then(r => { if (!r.ok) throw new Error('Failed'); return r.json() })
+      .then(d => { setData(d); setLoading(false) })
+      .catch(e => { setError(e.message); setLoading(false) })
+  }, [leagueId])
+
+  if (loading) return <div className="spinner" />
+  if (error) return <div style={{ color: 'var(--red)', padding: 20 }}>Could not load power rankings: {error}</div>
+
+  const rankings = data?.rankings || []
+  const completedWeeks = data?.completed_weeks || []
+
+  if (!rankings.length) {
+    return <div style={{ color: 'var(--muted)', textAlign: 'center', padding: 40 }}>No matchup data available yet for this league.</div>
+  }
+
+  // Build a map from roster_id → is_me using standings prop
+  const standingsMap = {}
+  if (standings) standings.forEach(s => { standingsMap[s.roster_id] = s })
+
+  const maxPower = Math.max(...rankings.map(r => r.power_score))
+  const maxPPG = Math.max(...rankings.map(r => r.ppg))
+
+  function luckLabel(luck) {
+    if (luck >= 2)  return { text: `+${luck.toFixed(1)} lucky`,   color: '#22c55e' }
+    if (luck >= 0.5) return { text: `+${luck.toFixed(1)}`,        color: '#86efac' }
+    if (luck >= -0.5) return { text: 'Even',                      color: 'var(--muted)' }
+    if (luck >= -2)  return { text: `${luck.toFixed(1)}`,         color: '#f97316' }
+    return { text: `${luck.toFixed(1)} unlucky`, color: '#ef4444' }
+  }
+
+  function Sparkline({ weekly, weeks }) {
+    if (!weeks.length) return null
+    const vals = weeks.map(w => weekly[w] || 0)
+    const min = Math.min(...vals)
+    const max = Math.max(...vals) || 1
+    const w = 80, h = 28, pad = 3
+    const pts = vals.map((v, i) => {
+      const x = pad + (i / Math.max(vals.length - 1, 1)) * (w - pad * 2)
+      const y = pad + (1 - (v - min) / (max - min || 1)) * (h - pad * 2)
+      return `${x},${y}`
+    }).join(' ')
+    return (
+      <svg width={w} height={h} style={{ display: 'block' }}>
+        <polyline points={pts} fill="none" stroke="var(--accent)" strokeWidth="1.5" strokeLinejoin="round" />
+        {vals.map((v, i) => {
+          const x = pad + (i / Math.max(vals.length - 1, 1)) * (w - pad * 2)
+          const y = pad + (1 - (v - min) / (max - min || 1)) * (h - pad * 2)
+          return <circle key={i} cx={x} cy={y} r="2" fill="var(--accent)" />
+        })}
+      </svg>
+    )
+  }
+
+  return (
+    <div>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+        <div>
+          <div style={{ fontSize: 15, fontWeight: 700 }}>Power Rankings</div>
+          <div style={{ fontSize: 12, color: 'var(--muted)', marginTop: 2 }}>
+            Composite score: 40% PPG + 35% Expected Wins + 25% Recent Form (last 3 wks)
+          </div>
+        </div>
+        {completedWeeks.length > 0 && (
+          <div style={{ fontSize: 12, color: 'var(--muted)' }}>
+            {completedWeeks.length} weeks completed · Wks {completedWeeks[0]}–{completedWeeks[completedWeeks.length - 1]}
+          </div>
+        )}
+      </div>
+
+      {/* Header */}
+      <div style={{ display: 'grid', gridTemplateColumns: '36px 1fr 70px 90px 80px 80px 70px 90px', alignItems: 'center', padding: '8px 14px', fontSize: 10, color: 'var(--muted)', fontWeight: 700, textTransform: 'uppercase', letterSpacing: 0.5, borderBottom: '2px solid var(--border)' }}>
+        <div>#</div>
+        <div>Team</div>
+        <div style={{ textAlign: 'center' }}>Record</div>
+        <div style={{ textAlign: 'center' }}>Exp W</div>
+        <div style={{ textAlign: 'right' }}>PPG</div>
+        <div style={{ textAlign: 'right' }}>Recent</div>
+        <div style={{ textAlign: 'right' }}>Luck</div>
+        <div style={{ textAlign: 'right' }}>Power</div>
+      </div>
+
+      {rankings.map((team, i) => {
+        const standingTeam = standingsMap[team.roster_id]
+        const isMe = standingTeam?.is_me || false
+        const { text: luckText, color: luckColor } = luckLabel(team.luck)
+        const powerPct = maxPower > 0 ? (team.power_score / maxPower) * 100 : 0
+        const powerColor = powerPct >= 80 ? '#22c55e' : powerPct >= 60 ? '#3b82f6' : powerPct >= 40 ? '#f59e0b' : '#ef4444'
+        const isExpanded = highlight === team.roster_id
+
+        return (
+          <div key={team.roster_id}>
+            <div
+              onClick={() => setHighlight(isExpanded ? null : team.roster_id)}
+              style={{
+                display: 'grid', gridTemplateColumns: '36px 1fr 70px 90px 80px 80px 70px 90px',
+                alignItems: 'center', padding: '11px 14px',
+                borderBottom: isExpanded ? 'none' : '1px solid var(--border)',
+                background: isMe ? 'var(--accent)0d' : i % 2 === 0 ? 'transparent' : 'rgba(255,255,255,0.012)',
+                borderLeft: isMe ? '3px solid var(--accent)' : '3px solid transparent',
+                cursor: 'pointer', transition: 'background 0.1s',
+              }}
+              onMouseEnter={e => { if (!isMe) e.currentTarget.style.background = 'rgba(255,255,255,0.04)' }}
+              onMouseLeave={e => { if (!isMe) e.currentTarget.style.background = i % 2 === 0 ? 'transparent' : 'rgba(255,255,255,0.012)' }}
+            >
+              {/* Rank */}
+              <div style={{ fontWeight: 800, fontSize: 15, color: i < 3 ? ['#f59e0b','#9ca3af','#cd7f32'][i] : 'var(--muted)' }}>
+                {i + 1}
+              </div>
+
+              {/* Team */}
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+                {team.avatar
+                  ? <img src={`https://sleepercdn.com/avatars/thumbs/${team.avatar}`} alt="" style={{ width: 28, height: 28, borderRadius: 6, objectFit: 'cover', flexShrink: 0 }} onError={e => e.target.style.display='none'} />
+                  : <div style={{ width: 28, height: 28, borderRadius: 6, background: 'var(--surface2)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 12 }}>🏈</div>
+                }
+                <div style={{ minWidth: 0 }}>
+                  <div style={{ fontWeight: isMe ? 700 : 600, fontSize: 13, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                    {team.display_name}{isMe && <span style={{ marginLeft: 6, fontSize: 10, color: 'var(--accent)' }}>YOU</span>}
+                  </div>
+                  <div style={{ height: 3, background: 'var(--border)', borderRadius: 2, marginTop: 3, overflow: 'hidden', width: 60 }}>
+                    <div style={{ width: `${powerPct}%`, height: '100%', background: powerColor, borderRadius: 2 }} />
+                  </div>
+                </div>
+              </div>
+
+              {/* Record */}
+              <div style={{ textAlign: 'center', fontSize: 13, fontWeight: 600 }}>
+                {team.wins}-{team.losses}{team.ties > 0 ? `-${team.ties}` : ''}
+              </div>
+
+              {/* Expected Wins */}
+              <div style={{ textAlign: 'center', fontSize: 13 }}>
+                <span style={{ fontWeight: 600 }}>{team.expected_wins.toFixed(1)}</span>
+                <span style={{ fontSize: 10, color: 'var(--muted)', display: 'block' }}>exp</span>
+              </div>
+
+              {/* PPG */}
+              <div style={{ textAlign: 'right', fontSize: 13, fontWeight: 600 }}>
+                {team.ppg > 0 ? team.ppg.toFixed(1) : '—'}
+              </div>
+
+              {/* Recent PPG */}
+              <div style={{ textAlign: 'right' }}>
+                <div style={{ fontSize: 13, fontWeight: 600 }}>{team.recent_ppg > 0 ? team.recent_ppg.toFixed(1) : '—'}</div>
+                <Sparkline weekly={team.weekly_scores} weeks={completedWeeks.slice(-5)} />
+              </div>
+
+              {/* Luck */}
+              <div style={{ textAlign: 'right', fontSize: 12, fontWeight: 700, color: luckColor }}>
+                {luckText}
+              </div>
+
+              {/* Power Score */}
+              <div style={{ textAlign: 'right' }}>
+                <div style={{ fontSize: 16, fontWeight: 800, color: powerColor }}>{team.power_score.toFixed(0)}</div>
+                <div style={{ fontSize: 10, color: 'var(--muted)' }}>/ 100</div>
+              </div>
+            </div>
+
+            {/* Expanded: weekly score breakdown */}
+            {isExpanded && (
+              <div style={{ padding: '10px 14px 14px', borderBottom: '1px solid var(--border)', background: isMe ? 'var(--accent)07' : 'rgba(255,255,255,0.018)' }}>
+                <div style={{ fontSize: 11, color: 'var(--muted)', fontWeight: 700, marginBottom: 8, textTransform: 'uppercase', letterSpacing: 0.5 }}>
+                  Weekly Scores — Wk {completedWeeks[0]} to {completedWeeks[completedWeeks.length - 1]}
+                </div>
+                <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                  {completedWeeks.map(w => {
+                    const pts = team.weekly_scores[w]
+                    const allPts = rankings.map(r => r.weekly_scores[w] || 0)
+                    const rank = allPts.filter(p => p > (pts || 0)).length + 1
+                    const top3 = rank <= 3
+                    const last3 = rank >= rankings.length - 2
+                    return (
+                      <div key={w} style={{
+                        textAlign: 'center', padding: '6px 10px', borderRadius: 8, minWidth: 52,
+                        background: top3 ? '#22c55e18' : last3 ? '#ef444418' : 'var(--surface2)',
+                        border: `1px solid ${top3 ? '#22c55e40' : last3 ? '#ef444440' : 'var(--border)'}`,
+                      }}>
+                        <div style={{ fontSize: 10, color: 'var(--muted)' }}>Wk {w}</div>
+                        <div style={{ fontSize: 13, fontWeight: 700, color: top3 ? '#22c55e' : last3 ? '#ef4444' : 'var(--text)' }}>
+                          {pts != null ? pts.toFixed(1) : '—'}
+                        </div>
+                        <div style={{ fontSize: 10, color: 'var(--muted)' }}>#{rank}</div>
+                      </div>
+                    )
+                  })}
+                </div>
+                <div style={{ display: 'flex', gap: 20, marginTop: 10, fontSize: 12, color: 'var(--muted)' }}>
+                  <span>PF: <strong style={{ color: 'var(--text)' }}>{team.fpts.toFixed(1)}</strong></span>
+                  <span>PA: <strong style={{ color: 'var(--text)' }}>{team.fpts_against.toFixed(1)}</strong></span>
+                  <span>Expected W: <strong style={{ color: 'var(--text)' }}>{team.expected_wins.toFixed(1)}</strong></span>
+                  <span>Luck: <strong style={{ color: luckColor }}>{team.luck > 0 ? '+' : ''}{team.luck.toFixed(1)}</strong></span>
+                </div>
+              </div>
+            )}
+          </div>
+        )
+      })}
+
+      {/* Legend */}
+      <div style={{ display: 'flex', gap: 20, padding: '12px 14px', fontSize: 11, color: 'var(--muted)', borderTop: '1px solid var(--border)', marginTop: 4, flexWrap: 'wrap' }}>
+        <span><strong>Exp W</strong> = expected wins vs every opponent each week</span>
+        <span><strong>Luck</strong> = actual wins − expected wins</span>
+        <span><strong>Recent</strong> = avg last 3 wks · click row to expand weekly breakdown</span>
+      </div>
+    </div>
+  )
+}
+
 function StandingsView({ standings, myTeam }) {
   return (
     <div style={{ background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 12, overflow: 'hidden' }}>
@@ -530,8 +1114,26 @@ function StandingsView({ standings, myTeam }) {
 }
 
 // ─── Trade Analyzer View ──────────────────────────────────────────────────────
+const DYNASTY_AGE_PEAK = { QB: 28, WR: 25, RB: 24, TE: 26 }
+
+function ageTrajectory(pos, age) {
+  if (!age || !pos) return 'unknown'
+  const peak = DYNASTY_AGE_PEAK[pos] || 26
+  if (age < peak - 2) return 'rising'
+  if (age <= peak + 1) return 'peak'
+  if (age <= peak + 3) return 'declining'
+  return 'aging'
+}
+
+function trajectoryColor(t) {
+  return { rising: '#22c55e', peak: '#3b82f6', declining: '#f59e0b', aging: '#ef4444', unknown: 'var(--muted)' }[t] || 'var(--muted)'
+}
+
 function TradeAnalyzerView() {
-  const [allPlayers, setAllPlayers] = useState([])
+  const [mode, setMode] = useState('dynasty') // 'dynasty' | 'redraft'
+  const [superflex, setSuperflex] = useState(false)
+  const [allDynastyPlayers, setAllDynastyPlayers] = useState([])
+  const [allRedraftPlayers, setAllRedraftPlayers] = useState([])
   const [allPicks, setAllPicks] = useState([])
   const [loading, setLoading] = useState(true)
   const [mySide, setMySide] = useState([])
@@ -543,23 +1145,58 @@ function TradeAnalyzerView() {
   const [pickSearch, setPickSearch] = useState('')
 
   useEffect(() => {
+    setLoading(true)
+    const sfParam = superflex ? '&superflex=true' : ''
     Promise.all([
-      fetch('/api/dynasty/positional-rankings?position=ALL').then(r => r.json()),
+      fetch(`/api/dynasty/positional-rankings?position=ALL${sfParam}`).then(r => r.json()),
       fetch('/api/dynasty/picks').then(r => r.json()),
-    ]).then(([playersData, picksData]) => {
-      setAllPlayers(playersData.players || [])
+      fetch('/api/players?limit=300').then(r => r.json()),
+    ]).then(([dynData, picksData, playersData]) => {
+      setAllDynastyPlayers(dynData.players || [])
       setAllPicks(picksData.picks || [])
+      // Enrich redraft players with computed value = weighted PPG
+      const rp = (playersData.players || [])
+        .filter(p => ['WR', 'RB', 'TE', 'QB'].includes(p.position))
+        .map(p => {
+          const games = p.games || 0
+          const fpts = p.fantasy_points_ppr || 0
+          const ppg = games > 0 ? fpts / games : 0
+          const wppg = ppg * (games / 17)
+          return {
+            ...p,
+            name: p.player_display_name,
+            redraft_value: Math.round(wppg * 100), // scale to comparable units
+            ppg: Math.round(ppg * 10) / 10,
+            weighted_ppg: Math.round(wppg * 10) / 10,
+          }
+        })
+        .sort((a, b) => b.redraft_value - a.redraft_value)
+      setAllRedraftPlayers(rp)
       setLoading(false)
     }).catch(() => setLoading(false))
-  }, [])
+  }, [superflex])
+
+  // Clear sides when switching modes
+  function switchMode(m) {
+    setMode(m)
+    setMySide([])
+    setTheirSide([])
+    setMySearch('')
+    setTheirSearch('')
+  }
+
+  const allPlayers = mode === 'dynasty' ? allDynastyPlayers : allRedraftPlayers
+
+  function getValue(p) {
+    return mode === 'dynasty' ? (p.dynasty_value || 0) : (p.redraft_value || 0)
+  }
 
   function addPlayer(side, player) {
-    if (side === 'my' && mySide.length < 4 && !mySide.find(p => p.player_id === player.player_id && p.name === player.name)) {
-      setMySide([...mySide, player])
-      setMySearch('')
-    } else if (side === 'their' && theirSide.length < 4 && !theirSide.find(p => p.player_id === player.player_id && p.name === player.name)) {
-      setTheirSide([...theirSide, player])
-      setTheirSearch('')
+    const cap = 5
+    if (side === 'my' && mySide.length < cap && !mySide.find(p => p.name === player.name)) {
+      setMySide([...mySide, player]); setMySearch('')
+    } else if (side === 'their' && theirSide.length < cap && !theirSide.find(p => p.name === player.name)) {
+      setTheirSide([...theirSide, player]); setTheirSearch('')
     }
   }
 
@@ -568,135 +1205,300 @@ function TradeAnalyzerView() {
     else setTheirSide(theirSide.filter((_, i) => i !== idx))
   }
 
-  const myValue = mySide.reduce((s, p) => s + (p.dynasty_value || 0), 0)
-  const theirValue = theirSide.reduce((s, p) => s + (p.dynasty_value || 0), 0)
+  const myValue = mySide.reduce((s, p) => s + getValue(p), 0)
+  const theirValue = theirSide.reduce((s, p) => s + getValue(p), 0)
   const diff = myValue - theirValue
   const totalValue = myValue + theirValue
-
-  const myAvgAge = mySide.length ? mySide.reduce((s, p) => s + (p.age || 25), 0) / mySide.length : 0
-  const theirAvgAge = theirSide.length ? theirSide.reduce((s, p) => s + (p.age || 25), 0) / theirSide.length : 0
-  const ageDiff = theirAvgAge - myAvgAge  // positive = you're getting younger
-
-  // Percentage-based recommendation (more meaningful than raw value diff)
   const pctDiff = totalValue > 0 ? (diff / (totalValue / 2)) * 100 : 0
-  let recommendation = ''
-  let recColor = 'var(--muted)'
-  let recEmoji = ''
+
+  // Age analysis (dynasty only)
+  const mySkillPlayers = mySide.filter(p => p.position !== 'PICK' && p.age)
+  const theirSkillPlayers = theirSide.filter(p => p.position !== 'PICK' && p.age)
+  const myAvgAge = mySkillPlayers.length ? mySkillPlayers.reduce((s, p) => s + p.age, 0) / mySkillPlayers.length : null
+  const theirAvgAge = theirSkillPlayers.length ? theirSkillPlayers.reduce((s, p) => s + p.age, 0) / theirSkillPlayers.length : null
+  const ageDiff = (myAvgAge && theirAvgAge) ? theirAvgAge - myAvgAge : null  // positive = you get younger
+
+  // ML edge (dynasty only)
+  const myAvgML = mySkillPlayers.length ? mySkillPlayers.reduce((s, p) => s + (p.predicted_value_score_2026 || 50), 0) / mySkillPlayers.length : null
+  const theirAvgML = theirSkillPlayers.length ? theirSkillPlayers.reduce((s, p) => s + (p.predicted_value_score_2026 || 50), 0) / theirSkillPlayers.length : null
+
+  // Position breakdown
+  const POSITIONS_ORDER = ['QB', 'WR', 'RB', 'TE']
+  function posBreakdown(side) {
+    const counts = {}
+    side.filter(p => p.position !== 'PICK').forEach(p => {
+      counts[p.position] = (counts[p.position] || 0) + 1
+    })
+    return counts
+  }
+  const myPos = posBreakdown(mySide)
+  const theirPos = posBreakdown(theirSide)
+
+  // Verdict
+  let recommendation = '', recColor = 'var(--muted)'
   if (mySide.length && theirSide.length) {
-    if (pctDiff >= 20)       { recommendation = 'Strong Win'; recColor = 'var(--green)'; recEmoji = '🔥' }
-    else if (pctDiff >= 8)   { recommendation = 'Slight Win';  recColor = '#a3e635';     recEmoji = '✅' }
-    else if (pctDiff >= -8)  { recommendation = 'Even Trade';  recColor = '#f59e0b';     recEmoji = '⚖️' }
-    else if (pctDiff >= -20) { recommendation = 'Slight Loss'; recColor = '#f5a623';     recEmoji = '⚠️' }
-    else                     { recommendation = 'Strong Loss'; recColor = 'var(--red)';  recEmoji = '🚨' }
+    if (pctDiff >= 20)       { recommendation = 'Strong Win';  recColor = '#22c55e' }
+    else if (pctDiff >= 8)   { recommendation = 'Slight Win';  recColor = '#a3e635' }
+    else if (pctDiff >= -8)  { recommendation = 'Even Trade';  recColor = '#f59e0b' }
+    else if (pctDiff >= -20) { recommendation = 'Slight Loss'; recColor = '#f97316' }
+    else                     { recommendation = 'Strong Loss'; recColor = '#ef4444' }
   }
 
   function filterPlayers(search) {
     if (!search) return []
     const s = search.toLowerCase()
-    return allPlayers.filter(p => p.name.toLowerCase().includes(s)).slice(0, 8)
+    return allPlayers.filter(p => (p.name || '').toLowerCase().includes(s)).slice(0, 8)
+  }
+
+  // Key insight bullets
+  const insights = []
+  if (mySide.length && theirSide.length) {
+    if (mode === 'dynasty') {
+      if (ageDiff !== null && Math.abs(ageDiff) >= 1) {
+        insights.push({
+          text: ageDiff > 0
+            ? `You get ${ageDiff.toFixed(1)} years younger on average — dynasty upside`
+            : `You get ${Math.abs(ageDiff).toFixed(1)} years older — prioritize if win-now`,
+          good: ageDiff > 0,
+        })
+      }
+      if (myAvgML !== null && theirAvgML !== null && Math.abs(myAvgML - theirAvgML) >= 3) {
+        const mlEdge = myAvgML - theirAvgML
+        insights.push({
+          text: mlEdge > 0
+            ? `Your side has stronger 2026 ML projections (+${mlEdge.toFixed(0)} avg score)`
+            : `Their side has stronger 2026 ML projections (+${Math.abs(mlEdge).toFixed(0)} avg score)`,
+          good: mlEdge > 0,
+        })
+      }
+    } else {
+      const myPPG = mySide.reduce((s, p) => s + (p.ppg || 0), 0)
+      const theirPPG = theirSide.reduce((s, p) => s + (p.ppg || 0), 0)
+      const ppgDiff = myPPG - theirPPG
+      if (Math.abs(ppgDiff) >= 1) {
+        insights.push({
+          text: ppgDiff > 0
+            ? `Your side averages ${ppgDiff.toFixed(1)} more PPG — better weekly production`
+            : `Their side averages ${Math.abs(ppgDiff).toFixed(1)} more PPG — better weekly production`,
+          good: ppgDiff > 0,
+        })
+      }
+    }
+    // Position balance
+    const allPos = new Set([...Object.keys(myPos), ...Object.keys(theirPos)])
+    allPos.forEach(pos => {
+      const myCount = myPos[pos] || 0
+      const theirCount = theirPos[pos] || 0
+      if (myCount > 0 && theirCount === 0) {
+        insights.push({ text: `You're trading away ${pos} depth — check your roster need`, good: false })
+      }
+    })
   }
 
   if (loading) return <div className="spinner" />
 
   return (
     <div>
+      {/* Mode toggle */}
+      <div style={{ display: 'flex', gap: 8, marginBottom: 20, alignItems: 'center', flexWrap: 'wrap' }}>
+        {[['dynasty', 'Dynasty'], ['redraft', 'Redraft / Regular']].map(([m, label]) => (
+          <button key={m} onClick={() => switchMode(m)} style={{
+            padding: '7px 18px', borderRadius: 20, border: `1px solid ${mode === m ? 'var(--accent)' : 'var(--border)'}`,
+            background: mode === m ? 'var(--accent)22' : 'transparent',
+            color: mode === m ? 'var(--accent)' : 'var(--muted)',
+            fontWeight: 700, fontSize: 13, cursor: 'pointer',
+          }}>
+            {label}
+          </button>
+        ))}
+        {mode === 'dynasty' && (
+          <button onClick={() => { setSuperflex(s => !s); setMySide([]); setTheirSide([]) }} style={{
+            padding: '7px 14px', borderRadius: 20,
+            border: `1px solid ${superflex ? '#a78bfa' : 'var(--border)'}`,
+            background: superflex ? '#a78bfa22' : 'transparent',
+            color: superflex ? '#a78bfa' : 'var(--muted)',
+            fontWeight: 700, fontSize: 13, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 6,
+          }}>
+            <span style={{ fontSize: 10 }}>{superflex ? '●' : '○'}</span> Superflex
+          </button>
+        )}
+        <span style={{ fontSize: 12, color: 'var(--muted)', marginLeft: 4 }}>
+          {mode === 'dynasty'
+            ? superflex ? 'QB values weighted for superflex (FantasyCalc 2QB)' : 'Values from FantasyCalc · includes draft picks'
+            : '2025 PPG weighted by games played (×games/17)'}
+        </span>
+      </div>
+
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20, marginBottom: 24 }}>
-        {/* My Side */}
         <TradeSide
-          label="My Side"
-          players={mySide}
-          search={mySearch}
-          onSearch={setMySearch}
+          label="My Side" mode={mode}
+          players={mySide} search={mySearch} onSearch={setMySearch}
           suggestions={filterPlayers(mySearch)}
-          onAdd={p => addPlayer('my', p)}
-          onRemove={idx => removePlayer('my', idx)}
-          totalValue={myValue}
-          color="var(--accent)"
-          picks={allPicks}
-          pickSearch={pickSearch}
-          onPickSearch={setPickSearch}
+          onAdd={p => addPlayer('my', p)} onRemove={idx => removePlayer('my', idx)}
+          totalValue={myValue} color="var(--accent)"
+          picks={mode === 'dynasty' ? allPicks : []}
+          pickSearch={pickSearch} onPickSearch={setPickSearch}
           pickOpen={myPickOpen}
           onPickOpen={() => { setMyPickOpen(o => !o); setTheirPickOpen(false); setPickSearch('') }}
           onAddPick={p => { addPlayer('my', { ...p, player_id: `pick_${p.name}`, age: null }); setMyPickOpen(false) }}
         />
-        {/* Their Side */}
         <TradeSide
-          label="Their Side"
-          players={theirSide}
-          search={theirSearch}
-          onSearch={setTheirSearch}
+          label="Their Side" mode={mode}
+          players={theirSide} search={theirSearch} onSearch={setTheirSearch}
           suggestions={filterPlayers(theirSearch)}
-          onAdd={p => addPlayer('their', p)}
-          onRemove={idx => removePlayer('their', idx)}
-          totalValue={theirValue}
-          color="var(--wr)"
-          picks={allPicks}
-          pickSearch={pickSearch}
-          onPickSearch={setPickSearch}
+          onAdd={p => addPlayer('their', p)} onRemove={idx => removePlayer('their', idx)}
+          totalValue={theirValue} color="var(--wr)"
+          picks={mode === 'dynasty' ? allPicks : []}
+          pickSearch={pickSearch} onPickSearch={setPickSearch}
           pickOpen={theirPickOpen}
           onPickOpen={() => { setTheirPickOpen(o => !o); setMyPickOpen(false); setPickSearch('') }}
           onAddPick={p => { addPlayer('their', { ...p, player_id: `pick_${p.name}`, age: null }); setTheirPickOpen(false) }}
         />
       </div>
 
-      {/* Value comparison */}
+      {/* Verdict panel */}
       {(mySide.length > 0 || theirSide.length > 0) && (
         <div style={{ background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 12, padding: 24 }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+
+          {/* Value totals + verdict */}
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
             <div>
-              <div style={{ fontSize: 12, color: 'var(--muted)', marginBottom: 4 }}>MY SIDE</div>
-              <div style={{ fontSize: 22, fontWeight: 800, color: 'var(--accent)' }}>{myValue.toLocaleString()}</div>
+              <div style={{ fontSize: 11, color: 'var(--muted)', marginBottom: 2 }}>MY SIDE</div>
+              <div style={{ fontSize: 26, fontWeight: 800, color: 'var(--accent)' }}>
+                {mode === 'dynasty' ? myValue.toLocaleString() : `${mySide.reduce((s, p) => s + (p.ppg || 0), 0).toFixed(1)} PPG`}
+              </div>
+              {mode === 'dynasty' && <div style={{ fontSize: 11, color: 'var(--muted)' }}>{myValue.toLocaleString()} pts</div>}
             </div>
+
             <div style={{ textAlign: 'center' }}>
-                {recommendation && (
-                <div>
-                  <div style={{ fontSize: 18, fontWeight: 800, color: recColor }}>{recEmoji} {recommendation}</div>
-                  <div style={{ fontSize: 12, color: 'var(--muted)', marginTop: 4 }}>{pctDiff > 0 ? '+' : ''}{pctDiff.toFixed(1)}% value differential</div>
-                </div>
-              )}
-              {mySide.length > 0 && theirSide.length > 0 && Math.abs(ageDiff) > 1 && (
-                <div style={{ fontSize: 12, color: ageDiff > 0 ? 'var(--green)' : '#f5a623', marginTop: 4 }}>
-                  {ageDiff > 0 ? '⬇ You get younger' : '⬆ You get older'} by {Math.abs(ageDiff).toFixed(1)}yr avg
-                </div>
+              {recommendation ? (
+                <>
+                  <div style={{ fontSize: 20, fontWeight: 800, color: recColor }}>{recommendation}</div>
+                  <div style={{ fontSize: 12, color: 'var(--muted)', marginTop: 2 }}>
+                    {pctDiff > 0 ? '+' : ''}{pctDiff.toFixed(1)}% value differential
+                  </div>
+                </>
+              ) : (
+                <div style={{ fontSize: 13, color: 'var(--muted)' }}>Add players to both sides</div>
               )}
             </div>
+
             <div style={{ textAlign: 'right' }}>
-              <div style={{ fontSize: 12, color: 'var(--muted)', marginBottom: 4 }}>THEIR SIDE</div>
-              <div style={{ fontSize: 22, fontWeight: 800, color: 'var(--wr)' }}>{theirValue.toLocaleString()}</div>
+              <div style={{ fontSize: 11, color: 'var(--muted)', marginBottom: 2 }}>THEIR SIDE</div>
+              <div style={{ fontSize: 26, fontWeight: 800, color: 'var(--wr)' }}>
+                {mode === 'dynasty' ? theirValue.toLocaleString() : `${theirSide.reduce((s, p) => s + (p.ppg || 0), 0).toFixed(1)} PPG`}
+              </div>
+              {mode === 'dynasty' && <div style={{ fontSize: 11, color: 'var(--muted)' }}>{theirValue.toLocaleString()} pts</div>}
             </div>
           </div>
 
           {/* Value bar */}
           {totalValue > 0 && (
-            <div style={{ height: 10, background: 'var(--border)', borderRadius: 5, overflow: 'hidden', display: 'flex' }}>
-              <div style={{ width: `${(myValue / totalValue) * 100}%`, background: 'var(--accent)', transition: 'width 0.3s' }} />
-              <div style={{ width: `${(theirValue / totalValue) * 100}%`, background: 'var(--wr)', transition: 'width 0.3s' }} />
+            <div style={{ height: 8, background: 'var(--border)', borderRadius: 4, overflow: 'hidden', display: 'flex', marginBottom: 20 }}>
+              <div style={{ width: `${(myValue / totalValue) * 100}%`, background: 'var(--accent)', transition: 'width 0.4s' }} />
+              <div style={{ width: `${(theirValue / totalValue) * 100}%`, background: 'var(--wr)', transition: 'width 0.4s' }} />
             </div>
           )}
 
-          {mySide.length > 0 && theirSide.length > 0 && diff !== 0 ? (
-            <div style={{ marginTop: 12, fontSize: 13, color: 'var(--muted)', textAlign: 'center' }}>
-              Raw value difference: <span style={{ fontWeight: 700, color: diff > 0 ? 'var(--green)' : 'var(--red)' }}>{diff > 0 ? '+' : ''}{diff.toLocaleString()}</span>
+          {/* Position breakdown */}
+          {(mySide.length > 0 || theirSide.length > 0) && (
+            <div style={{ display: 'flex', gap: 8, marginBottom: 16, flexWrap: 'wrap' }}>
+              {POSITIONS_ORDER.map(pos => {
+                const my = myPos[pos] || 0
+                const their = theirPos[pos] || 0
+                if (!my && !their) return null
+                const color = POS_COLORS[pos] || 'var(--accent)'
+                return (
+                  <div key={pos} style={{ background: color + '11', border: `1px solid ${color}33`, borderRadius: 8, padding: '6px 12px', textAlign: 'center', minWidth: 60 }}>
+                    <div style={{ fontSize: 10, fontWeight: 700, color, marginBottom: 2 }}>{pos}</div>
+                    <div style={{ fontSize: 13, fontWeight: 700 }}>
+                      <span style={{ color: 'var(--accent)' }}>{my}</span>
+                      <span style={{ color: 'var(--muted)' }}> / </span>
+                      <span style={{ color: 'var(--wr)' }}>{their}</span>
+                    </div>
+                    <div style={{ fontSize: 9, color: 'var(--muted)' }}>you / them</div>
+                  </div>
+                )
+              })}
+              {mySide.some(p => p.position === 'PICK') || theirSide.some(p => p.position === 'PICK') ? (
+                <div style={{ background: '#f59e0b11', border: '1px solid #f59e0b33', borderRadius: 8, padding: '6px 12px', textAlign: 'center', minWidth: 60 }}>
+                  <div style={{ fontSize: 10, fontWeight: 700, color: '#f59e0b', marginBottom: 2 }}>PICK</div>
+                  <div style={{ fontSize: 13, fontWeight: 700 }}>
+                    <span style={{ color: 'var(--accent)' }}>{mySide.filter(p => p.position === 'PICK').length}</span>
+                    <span style={{ color: 'var(--muted)' }}> / </span>
+                    <span style={{ color: 'var(--wr)' }}>{theirSide.filter(p => p.position === 'PICK').length}</span>
+                  </div>
+                  <div style={{ fontSize: 9, color: 'var(--muted)' }}>you / them</div>
+                </div>
+              ) : null}
             </div>
-          ) : null}
+          )}
+
+          {/* Dynasty-only: Age + ML row */}
+          {mode === 'dynasty' && mySide.length > 0 && theirSide.length > 0 && (
+            <div style={{ display: 'flex', gap: 16, marginBottom: 16, flexWrap: 'wrap' }}>
+              {ageDiff !== null && (
+                <div style={{ background: 'var(--surface2)', borderRadius: 8, padding: '8px 14px', flex: 1, minWidth: 140 }}>
+                  <div style={{ fontSize: 11, color: 'var(--muted)', marginBottom: 2 }}>Avg Age</div>
+                  <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
+                    <span style={{ color: 'var(--accent)', fontWeight: 700 }}>{myAvgAge?.toFixed(1)}</span>
+                    <span style={{ color: 'var(--muted)', fontSize: 11 }}>→</span>
+                    <span style={{ color: 'var(--wr)', fontWeight: 700 }}>{theirAvgAge?.toFixed(1)}</span>
+                    <span style={{ fontSize: 11, color: ageDiff > 0 ? '#22c55e' : '#f97316', marginLeft: 'auto' }}>
+                      {ageDiff > 0 ? '▼' : '▲'} {Math.abs(ageDiff).toFixed(1)}yr {ageDiff > 0 ? 'younger' : 'older'}
+                    </span>
+                  </div>
+                </div>
+              )}
+              {myAvgML !== null && theirAvgML !== null && (
+                <div style={{ background: 'var(--surface2)', borderRadius: 8, padding: '8px 14px', flex: 1, minWidth: 140 }}>
+                  <div style={{ fontSize: 11, color: 'var(--muted)', marginBottom: 2 }}>2026 ML Score</div>
+                  <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
+                    <span style={{ color: 'var(--accent)', fontWeight: 700 }}>{myAvgML?.toFixed(0)}</span>
+                    <span style={{ color: 'var(--muted)', fontSize: 11 }}>vs</span>
+                    <span style={{ color: 'var(--wr)', fontWeight: 700 }}>{theirAvgML?.toFixed(0)}</span>
+                    <span style={{ fontSize: 11, color: myAvgML > theirAvgML ? '#22c55e' : '#f97316', marginLeft: 'auto' }}>
+                      {myAvgML > theirAvgML ? 'You edge ML' : 'They edge ML'}
+                    </span>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Key insights */}
+          {insights.length > 0 && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              {insights.map((ins, i) => (
+                <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, color: 'var(--text)' }}>
+                  <span style={{ color: ins.good ? '#22c55e' : '#f97316', flexShrink: 0 }}>{ins.good ? '✓' : '!'}</span>
+                  {ins.text}
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       )}
     </div>
   )
 }
 
-function TradeSide({ label, players, search, onSearch, suggestions, onAdd, onRemove, totalValue, color,
+function TradeSide({ label, mode, players, search, onSearch, suggestions, onAdd, onRemove, totalValue, color,
   picks, pickSearch, onPickSearch, pickOpen, onPickOpen, onAddPick }) {
 
   const filteredPicks = picks
     ? picks.filter(p => !pickSearch || p.name.toLowerCase().includes(pickSearch.toLowerCase())).slice(0, 20)
     : []
 
+  const totalDisplay = mode === 'dynasty'
+    ? totalValue.toLocaleString()
+    : `${players.reduce((s, p) => s + (p.ppg || 0), 0).toFixed(1)} PPG`
+
   return (
     <div style={{ background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 12, padding: 20 }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
         <div style={{ fontWeight: 700, fontSize: 15, color }}>{label}</div>
-        <div style={{ fontSize: 13, color: 'var(--muted)' }}>Total: <span style={{ fontWeight: 700, color }}>{totalValue.toLocaleString()}</span></div>
+        <div style={{ fontSize: 13, color: 'var(--muted)' }}>Total: <span style={{ fontWeight: 700, color }}>{totalDisplay}</span></div>
       </div>
 
       {/* Search + Add Pick button */}
@@ -717,8 +1519,11 @@ function TradeSide({ label, players, search, onSearch, suggestions, onAdd, onRem
                     onMouseEnter={e => e.currentTarget.style.background = 'var(--surface2)'}
                     onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
                     <span style={{ fontSize: 11, fontWeight: 700, color: POS_COLORS[p.position], background: (POS_COLORS[p.position] || '#888') + '22', padding: '1px 5px', borderRadius: 4 }}>{p.position}</span>
-                    <span style={{ fontSize: 13, fontWeight: 600 }}>{p.name}</span>
-                    <span style={{ fontSize: 11, color: 'var(--muted)', marginLeft: 'auto' }}>{p.dynasty_value?.toLocaleString() || '—'}</span>
+                    <span style={{ fontSize: 13, fontWeight: 600, flex: 1 }}>{p.name}</span>
+                    {mode === 'dynasty'
+                      ? <span style={{ fontSize: 11, color: 'var(--muted)' }}>{p.dynasty_value?.toLocaleString() || '—'}</span>
+                      : <span style={{ fontSize: 11, color: 'var(--muted)' }}>{p.ppg?.toFixed(1) || '—'} PPG</span>
+                    }
                   </div>
                 ))}
               </div>
@@ -772,20 +1577,81 @@ function TradeSide({ label, players, search, onSearch, suggestions, onAdd, onRem
         {players.length === 0 && (
           <div style={{ color: 'var(--muted)', fontSize: 13, textAlign: 'center', paddingTop: 20 }}>Add players or picks</div>
         )}
-        {players.map((p, i) => (
-          <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 10px', background: 'var(--surface2)', borderRadius: 8, borderLeft: p.position === 'PICK' ? '3px solid #f59e0b' : '3px solid transparent' }}>
-            {p.position === 'PICK'
-              ? <span style={{ fontSize: 11, fontWeight: 700, color: '#f59e0b', background: '#f59e0b22', padding: '2px 6px', borderRadius: 4, whiteSpace: 'nowrap' }}>🎟 PICK</span>
-              : posBadge(p.position)
-            }
-            <div style={{ flex: 1 }}>
-              <div style={{ fontSize: 13, fontWeight: 600 }}>{p.name}</div>
-              {p.age != null && <div style={{ fontSize: 11, color: 'var(--muted)' }}>Age {p.age}</div>}
+        {players.map((p, i) => {
+          const isPick = p.position === 'PICK'
+          const posColor = POS_COLORS[p.position] || 'var(--accent)'
+          const traj = !isPick && mode === 'dynasty' ? ageTrajectory(p.position, p.age) : null
+          const trajColor = trajectoryColor(traj)
+          const mlScore = p.predicted_value_score_2026
+          return (
+            <div key={i} style={{
+              padding: '10px 12px', background: 'var(--surface2)', borderRadius: 8,
+              borderLeft: `3px solid ${isPick ? '#f59e0b' : posColor}`,
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                {isPick
+                  ? <span style={{ fontSize: 11, fontWeight: 700, color: '#f59e0b', background: '#f59e0b22', padding: '2px 6px', borderRadius: 4, whiteSpace: 'nowrap' }}>🎟 PICK</span>
+                  : posBadge(p.position)
+                }
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 13, fontWeight: 600, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{p.name}</div>
+                  {mode === 'dynasty' && !isPick && (
+                    <div style={{ fontSize: 11, color: 'var(--muted)', display: 'flex', gap: 8, marginTop: 1 }}>
+                      {p.age && <span>Age {p.age}</span>}
+                      {traj && <span style={{ color: trajColor, fontWeight: 600 }}>{traj}</span>}
+                      {p.team && <span>{p.team}</span>}
+                    </div>
+                  )}
+                  {mode === 'redraft' && !isPick && (
+                    <div style={{ fontSize: 11, color: 'var(--muted)', display: 'flex', gap: 8, marginTop: 1 }}>
+                      {p.recent_team && <span>{p.recent_team}</span>}
+                      {p.games != null && <span>{p.games}G</span>}
+                    </div>
+                  )}
+                </div>
+                <div style={{ textAlign: 'right', flexShrink: 0 }}>
+                  {mode === 'dynasty' && !isPick && (
+                    <>
+                      <div style={{ fontSize: 12, fontWeight: 700 }}>{(p.dynasty_value || 0).toLocaleString()}</div>
+                      {mlScore != null && (
+                        <div style={{ fontSize: 10, color: mlScore >= 60 ? '#22c55e' : mlScore >= 50 ? '#f59e0b' : '#ef4444' }}>
+                          ML {mlScore.toFixed(0)}
+                        </div>
+                      )}
+                    </>
+                  )}
+                  {mode === 'dynasty' && isPick && (
+                    <div style={{ fontSize: 12, fontWeight: 700 }}>{(p.dynasty_value || 0).toLocaleString()}</div>
+                  )}
+                  {mode === 'redraft' && !isPick && (
+                    <>
+                      <div style={{ fontSize: 12, fontWeight: 700 }}>{p.ppg?.toFixed(1)} PPG</div>
+                      <div style={{ fontSize: 10, color: 'var(--muted)' }}>
+                        {p.fantasy_points_ppr ? Math.round(p.fantasy_points_ppr) + ' total' : ''}
+                      </div>
+                    </>
+                  )}
+                </div>
+                <button onClick={() => onRemove(i)} style={{ background: 'none', border: 'none', color: 'var(--muted)', cursor: 'pointer', fontSize: 18, padding: '0 2px', lineHeight: 1, flexShrink: 0 }}>×</button>
+              </div>
+              {/* Mini value bar */}
+              {mode === 'dynasty' && !isPick && p.dynasty_value > 0 && (
+                <div style={{ marginTop: 6 }}>
+                  <div style={{ height: 3, background: 'var(--border)', borderRadius: 2, overflow: 'hidden' }}>
+                    <div style={{ width: `${Math.min(100, (p.dynasty_value / 10000) * 100)}%`, height: '100%', background: posColor, borderRadius: 2 }} />
+                  </div>
+                </div>
+              )}
+              {mode === 'redraft' && !isPick && p.ppg > 0 && (
+                <div style={{ marginTop: 6 }}>
+                  <div style={{ height: 3, background: 'var(--border)', borderRadius: 2, overflow: 'hidden' }}>
+                    <div style={{ width: `${Math.min(100, (p.ppg / 35) * 100)}%`, height: '100%', background: posColor, borderRadius: 2 }} />
+                  </div>
+                </div>
+              )}
             </div>
-            <div style={{ width: 80 }}>{dynastyValueBar(p.dynasty_value || 0)}</div>
-            <button onClick={() => onRemove(i)} style={{ background: 'none', border: 'none', color: 'var(--red)', cursor: 'pointer', fontSize: 16, padding: '0 4px' }}>×</button>
-          </div>
-        ))}
+          )
+        })}
       </div>
     </div>
   )
@@ -798,14 +1664,16 @@ function PositionalRankingsView() {
   const [pos, setPos] = useState('ALL')
   const [search, setSearch] = useState('')
   const [sortKey, setSortKey] = useState('dynasty_value')
+  const [superflex, setSuperflex] = useState(false)
 
   useEffect(() => {
     setLoading(true)
-    fetch('/api/dynasty/positional-rankings?position=ALL')
+    const sfParam = superflex ? '&superflex=true' : ''
+    fetch(`/api/dynasty/positional-rankings?position=ALL${sfParam}`)
       .then(r => r.json())
       .then(d => { setAllPlayers(d.players || []); setLoading(false) })
       .catch(() => setLoading(false))
-  }, [])
+  }, [superflex])
 
   const players = allPlayers
     .filter(p => pos === 'ALL' || p.position === pos)
@@ -822,7 +1690,16 @@ function PositionalRankingsView() {
         {POSITIONS.map(p => (
           <button key={p} className={`filter-btn pos-${p} ${pos === p ? 'active' : ''}`} onClick={() => setPos(p)}>{p}</button>
         ))}
-        <span style={{ color: 'var(--muted)', fontSize: 12, marginLeft: 'auto' }}>{players.length} players</span>
+        <button onClick={() => setSuperflex(s => !s)} style={{
+          marginLeft: 'auto', padding: '4px 12px', borderRadius: 16,
+          border: `1px solid ${superflex ? '#a78bfa' : 'var(--border)'}`,
+          background: superflex ? '#a78bfa22' : 'transparent',
+          color: superflex ? '#a78bfa' : 'var(--muted)',
+          fontWeight: 700, fontSize: 12, cursor: 'pointer',
+        }}>
+          {superflex ? '● Superflex' : '○ Superflex'}
+        </button>
+        <span style={{ color: 'var(--muted)', fontSize: 12 }}>{players.length} players</span>
       </div>
       <div style={{ display: 'flex', gap: 10, marginBottom: 16, alignItems: 'center' }}>
         <input

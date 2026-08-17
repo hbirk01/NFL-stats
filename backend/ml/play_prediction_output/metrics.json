@@ -1,0 +1,104 @@
+{
+  "train_years": [
+    2019,
+    2020,
+    2021,
+    2022,
+    2023
+  ],
+  "test_year": 2024,
+  "n_train": 172397,
+  "n_test": 33635,
+  "accuracy": 0.716277686933254,
+  "auc": 0.7870538520638539,
+  "log_loss": 0.5516724232890245,
+  "majority_class_baseline": 0.5688419800802735,
+  "feature_importance": [
+    {
+      "feature": "shotgun",
+      "importance": 0.6263366341590881
+    },
+    {
+      "feature": "down",
+      "importance": 0.059827614575624466
+    },
+    {
+      "feature": "off_wr",
+      "importance": 0.05312685668468475
+    },
+    {
+      "feature": "posteam_timeouts_remaining",
+      "importance": 0.04175540804862976
+    },
+    {
+      "feature": "ydstogo",
+      "importance": 0.04100969061255455
+    },
+    {
+      "feature": "qtr",
+      "importance": 0.02862660028040409
+    },
+    {
+      "feature": "off_ol",
+      "importance": 0.024523267522454262
+    },
+    {
+      "feature": "score_differential",
+      "importance": 0.01811518520116806
+    },
+    {
+      "feature": "no_huddle",
+      "importance": 0.01779523678123951
+    },
+    {
+      "feature": "game_seconds_remaining",
+      "importance": 0.01721874251961708
+    },
+    {
+      "feature": "off_rb",
+      "importance": 0.014353010803461075
+    },
+    {
+      "feature": "posteam",
+      "importance": 0.013927485793828964
+    },
+    {
+      "feature": "off_te",
+      "importance": 0.012048388831317425
+    },
+    {
+      "feature": "yardline_100",
+      "importance": 0.01027949620038271
+    },
+    {
+      "feature": "defteam_timeouts_remaining",
+      "importance": 0.008741328492760658
+    },
+    {
+      "feature": "defteam",
+      "importance": 0.008597009815275669
+    },
+    {
+      "feature": "is_home",
+      "importance": 0.003718053223565221
+    }
+  ],
+  "pass_rate_by_down": [
+    {
+      "down": 1,
+      "pass_rate": 0.4719228967271267
+    },
+    {
+      "down": 2,
+      "pass_rate": 0.5917086537611598
+    },
+    {
+      "down": 3,
+      "pass_rate": 0.7428571428571429
+    },
+    {
+      "down": 4,
+      "pass_rate": 0.612859097127223
+    }
+  ]
+}

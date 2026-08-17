@@ -1,6 +1,6 @@
 # Python
 backend/venv/
-__pycache__/
+**/__pycache__/
 *.pyc
 *.pyo
 .env
@@ -11,3 +11,11 @@ frontend/dist/
 
 # OS
 .DS_Store
+
+# Keep data files (required for backend)
+!backend/*.parquet
+!backend/ml/*.pkl
+!backend/ml/*.json
+
+# Raw PBP download cache (large, re-derivable via nfl_data_py)
+backend/ml/pbp_raw/

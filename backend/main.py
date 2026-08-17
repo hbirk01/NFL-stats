@@ -11,12 +11,18 @@ import pandas as pd
 import anthropic
 
 app = FastAPI()
+
+ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "*").split(",")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
@@ -983,16 +989,18 @@ def get_player_sos(player_id: str):
 _dynasty_cache: dict = {}
 
 @app.get("/api/dynasty-adp")
-def get_dynasty_adp():
+def get_dynasty_adp(num_qbs: int = 1):
     """Dynasty startup rankings from FantasyCalc (overall rank, position rank, dynasty value, tier, trend)."""
     import time
     import httpx
 
-    if _dynasty_cache.get("data") and time.time() - _dynasty_cache.get("ts", 0) < 86400:
-        return _dynasty_cache["data"]
+    cache_key = f"data_{num_qbs}qb"
+    ts_key    = f"ts_{num_qbs}qb"
+    if _dynasty_cache.get(cache_key) and time.time() - _dynasty_cache.get(ts_key, 0) < 86400:
+        return _dynasty_cache[cache_key]
 
     try:
-        url = "https://api.fantasycalc.com/values/current?isDynasty=true&numQbs=1"
+        url = f"https://api.fantasycalc.com/values/current?isDynasty=true&numQbs={num_qbs}"
         resp = httpx.get(url, timeout=10, headers={"User-Agent": "GridIron/1.0"})
         resp.raise_for_status()
         fc_data = resp.json()
@@ -1032,9 +1040,9 @@ def get_dynasty_adp():
             "age": p.get("maybeAge"),
         })
 
-    _dynasty_cache["data"] = {"players": results, "count": len(results)}
-    _dynasty_cache["ts"] = time.time()
-    return _dynasty_cache["data"]
+    _dynasty_cache[cache_key] = {"players": results, "count": len(results)}
+    _dynasty_cache[ts_key] = time.time()
+    return _dynasty_cache[cache_key]
 
 
 _redraft_cache: dict = {}
@@ -1337,10 +1345,10 @@ def _load_pred_maps():
         pass
     return pred_map, pred_name_map
 
-def _load_dynasty_map():
+def _load_dynasty_map(num_qbs: int = 1):
     """Return dynasty values indexed by norm(name)."""
     try:
-        dyn = get_dynasty_adp()
+        dyn = get_dynasty_adp(num_qbs=num_qbs)
         return {_norm(p["name"]): p for p in dyn["players"]}
     except Exception:
         return {}
@@ -1357,8 +1365,14 @@ def _make_resolve_player(all_players, players_df, stat_map, pred_map, pred_name_
         # Match to our stats via gsis_id or name — always resolve to a plain dict
         stats = stat_map.get(gsis)
         if stats is None and name:
-            norm_name = _norm(name)
-            match = next((r for _, r in players_df.iterrows() if _norm(r.get("player_display_name","")) == norm_name), None)
+            norm_name_val = _norm(name)
+            match = next((r for _, r in players_df.iterrows() if _norm(r.get("player_display_name","")) == norm_name_val), None)
+            if match is None:
+                # Sleeper sometimes drops suffixes (e.g. "Marvin Harrison" instead of "Marvin Harrison Jr")
+                # Try prefix match scoped to the same position
+                match = next((r for _, r in players_df.iterrows()
+                              if _norm(r.get("player_display_name","")).startswith(norm_name_val)
+                              and r.get("position","") == pos), None)
             stats = dict(match) if match is not None else {}
         elif stats is not None:
             stats = dict(stats)
@@ -1367,6 +1381,13 @@ def _make_resolve_player(all_players, players_df, stat_map, pred_map, pred_name_
 
         pred = pred_map.get(gsis) or pred_name_map.get(_norm(name), {})
         dyn  = dynasty_name_map.get(_norm(name), {})
+        if not dyn and name:
+            # Prefix-match fallback for Sleeper name truncation (e.g. "Marvin Harrison" → "marvinharrisonjr")
+            norm_n = _norm(name)
+            candidates = [(k, v) for k, v in dynasty_name_map.items()
+                          if k.startswith(norm_n) and v.get("position","") == pos]
+            if len(candidates) == 1:
+                dyn = candidates[0][1]
 
         ppg = None
         weighted_ppg = None
@@ -1485,12 +1506,17 @@ def get_sleeper_league(league_id: str, username: str = ""):
     # Build username → user_id map for is_me detection
     username_to_uid = {u["display_name"].lower(): u["user_id"] for u in users}
 
+    # Detect superflex: Sleeper uses "SUPER_FLEX" slot in roster_positions
+    roster_positions = league_data.get("roster_positions", [])
+    is_superflex = "SUPER_FLEX" in roster_positions
+    num_qbs = 2 if is_superflex else 1
+
     data = load_data()
     players_df = data["players"]
     stat_map = {str(r["player_id"]): dict(r) for _, r in players_df.iterrows()}
 
     pred_map, pred_name_map = _load_pred_maps()
-    dynasty_name_map = _load_dynasty_map()
+    dynasty_name_map = _load_dynasty_map(num_qbs=num_qbs)
 
     resolve_player = _make_resolve_player(all_players, players_df, stat_map, pred_map, pred_name_map, dynasty_name_map)
 
@@ -1524,6 +1550,7 @@ def get_sleeper_league(league_id: str, username: str = ""):
         "season": league_data.get("season"),
         "num_teams": league_data.get("total_rosters"),
         "status": league_data.get("status"),
+        "is_superflex": is_superflex,
         "standings": standings,
         "_username_to_uid": username_to_uid,
     }
@@ -1555,18 +1582,19 @@ def get_my_team():
 
 
 @app.get("/api/dynasty/positional-rankings")
-def get_dynasty_positional_rankings(position: str = "ALL"):
+def get_dynasty_positional_rankings(position: str = "ALL", superflex: bool = False):
     """
     Dynasty positional rankings: merge FantasyCalc values + our stats + ML predictions.
     Sorted by dynasty_value descending.
     """
     import time
 
-    cache_key = f"pos_rankings_{position}"
+    num_qbs = 2 if superflex else 1
+    cache_key = f"pos_rankings_{position}_{num_qbs}qb"
     if _sleeper_cache.get(cache_key) and time.time() - _sleeper_cache.get(f"{cache_key}_ts", 0) < 3600:
         return _sleeper_cache[cache_key]
 
-    dyn_data = get_dynasty_adp()
+    dyn_data = get_dynasty_adp(num_qbs=num_qbs)
     dyn_players = dyn_data["players"]
 
     data = load_data()
@@ -1692,6 +1720,158 @@ def get_dynasty_picks():
     _sleeper_cache[cache_key] = result
     _sleeper_cache[f"{cache_key}_ts"] = time.time()
     return result
+
+
+@app.get("/api/sleeper/league/{league_id}/power-rankings")
+def get_power_rankings(league_id: str):
+    """
+    Compute power rankings for a Sleeper league.
+
+    Metrics:
+    - points_for / points_against / ppg: raw scoring
+    - expected_wins: sum over all weeks of (games you'd win vs every opponent that week)
+    - luck: actual_wins - expected_wins  (positive = lucky, negative = unlucky)
+    - recent_ppg: avg points last 3 completed weeks
+    - power_score: composite (0-100) weighted blend of ppg + expected_win_rate + recent form
+    """
+    import time, httpx
+
+    cache_key = f"power_{league_id}"
+    if _sleeper_cache.get(cache_key) and time.time() - _sleeper_cache.get(f"{cache_key}_ts", 0) < 1800:
+        return _sleeper_cache[cache_key]
+
+    try:
+        with httpx.Client(timeout=15) as client:
+            # Get league info (num teams, current week, season)
+            lg_r = client.get(f"https://api.sleeper.app/v1/league/{league_id}")
+            lg_r.raise_for_status()
+            lg = lg_r.json()
+
+            rosters_r = client.get(f"https://api.sleeper.app/v1/league/{league_id}/rosters")
+            rosters = rosters_r.json() or []
+
+            users_r = client.get(f"https://api.sleeper.app/v1/league/{league_id}/users")
+            users = users_r.json() or []
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Sleeper API unavailable: {e}")
+
+    user_map = {u["user_id"]: u.get("display_name", "Unknown") for u in users}
+    avatar_map = {u["user_id"]: (u.get("metadata", {}).get("avatar") or u.get("avatar")) for u in users}
+
+    # Determine completed weeks to fetch
+    current_week = lg.get("settings", {}).get("leg", 0) or 0  # 'leg' = current week in Sleeper
+    season_type = lg.get("season_type", "regular")
+    # Fetch weeks 1..current_week (skip week 0)
+    weeks_to_fetch = list(range(1, max(current_week, 1) + 1))
+
+    # weekly_scores[roster_id][week] = points
+    weekly_scores: dict = {}
+    for r in rosters:
+        weekly_scores[r["roster_id"]] = {}
+
+    try:
+        with httpx.Client(timeout=20) as client:
+            for week in weeks_to_fetch:
+                mu_r = client.get(f"https://api.sleeper.app/v1/league/{league_id}/matchups/{week}")
+                if mu_r.status_code != 200:
+                    continue
+                matchups = mu_r.json() or []
+                for entry in matchups:
+                    rid = entry.get("roster_id")
+                    pts = entry.get("points", 0) or 0
+                    if rid in weekly_scores:
+                        weekly_scores[rid][week] = float(pts)
+    except Exception:
+        pass  # Use whatever weeks loaded
+
+    completed_weeks = sorted({w for scores in weekly_scores.values() for w in scores if scores[w] > 0})
+
+    # Build per-team stats
+    roster_map = {r["roster_id"]: r for r in rosters}
+    results = []
+
+    for r in rosters:
+        rid = r["roster_id"]
+        owner_id = r.get("owner_id", "")
+        s = r.get("settings", {})
+        actual_wins = s.get("wins", 0)
+        actual_losses = s.get("losses", 0)
+        actual_ties = s.get("ties", 0)
+        fpts = round((s.get("fpts", 0) or 0) + (s.get("fpts_decimal", 0) or 0) / 100, 2)
+        fpts_against = round((s.get("fpts_against", 0) or 0) + (s.get("fpts_against_decimal", 0) or 0) / 100, 2)
+
+        my_weekly = weekly_scores.get(rid, {})
+        games_played = len(completed_weeks)
+
+        # Expected wins: for each week, count opponents you'd beat
+        expected_wins = 0.0
+        for week in completed_weeks:
+            my_pts = my_weekly.get(week, 0)
+            week_scores = [weekly_scores[other_rid].get(week, 0)
+                           for other_rid in weekly_scores if other_rid != rid]
+            if week_scores:
+                wins_vs_field = sum(1 for opp in week_scores if my_pts > opp)
+                # fractional: split ties
+                ties_vs_field = sum(0.5 for opp in week_scores if my_pts == opp)
+                expected_wins += (wins_vs_field + ties_vs_field) / len(week_scores)
+
+        # Recent form: last 3 completed weeks
+        recent_weeks = completed_weeks[-3:] if len(completed_weeks) >= 3 else completed_weeks
+        recent_pts = [my_weekly.get(w, 0) for w in recent_weeks]
+        recent_ppg = round(sum(recent_pts) / len(recent_pts), 2) if recent_pts else 0.0
+
+        ppg = round(fpts / games_played, 2) if games_played > 0 else 0.0
+        luck = round(actual_wins - expected_wins, 2)
+
+        results.append({
+            "roster_id": rid,
+            "display_name": user_map.get(owner_id, f"Team {rid}"),
+            "avatar": avatar_map.get(owner_id),
+            "wins": actual_wins,
+            "losses": actual_losses,
+            "ties": actual_ties,
+            "fpts": fpts,
+            "fpts_against": fpts_against,
+            "ppg": ppg,
+            "expected_wins": round(expected_wins, 2),
+            "luck": luck,
+            "recent_ppg": recent_ppg,
+            "recent_weeks": recent_weeks,
+            "weekly_scores": my_weekly,
+            "games_played": games_played,
+        })
+
+    if not results:
+        return {"rankings": [], "completed_weeks": completed_weeks}
+
+    # Compute power score (0–100 composite)
+    # Normalise ppg, expected_win_rate, recent_ppg within this league
+    def norm_list(vals):
+        mn, mx = min(vals), max(vals)
+        if mx == mn:
+            return [50.0] * len(vals)
+        return [((v - mn) / (mx - mn)) * 100 for v in vals]
+
+    ppg_vals = [r["ppg"] for r in results]
+    ew_vals = [r["expected_wins"] for r in results]
+    recent_vals = [r["recent_ppg"] for r in results]
+
+    ppg_norm = norm_list(ppg_vals)
+    ew_norm = norm_list(ew_vals)
+    recent_norm = norm_list(recent_vals)
+
+    for i, r in enumerate(results):
+        r["power_score"] = round(0.40 * ppg_norm[i] + 0.35 * ew_norm[i] + 0.25 * recent_norm[i], 1)
+
+    # Sort by power score
+    results.sort(key=lambda x: x["power_score"], reverse=True)
+    for i, r in enumerate(results):
+        r["power_rank"] = i + 1
+
+    out = {"rankings": results, "completed_weeks": completed_weeks, "current_week": current_week}
+    _sleeper_cache[cache_key] = out
+    _sleeper_cache[f"{cache_key}_ts"] = time.time()
+    return out
 
 
 # ── CB Coverage System ───────────────────────────────────────────────────────
@@ -2002,6 +2182,46 @@ def get_wr_cb_impact(player_id: str, opponent: str, year: int = 2025):
     _sleeper_cache[cache_key] = result
     _sleeper_cache[f"{cache_key}_ts"] = time.time()
     return result
+
+
+@app.get("/api/play-predictability")
+def get_play_predictability():
+    """
+    Run/pass predictability rankings from the XGBoost play-calling model
+    (backend/ml/play_prediction.py). Model is trained on situational
+    pre-snap features (down, distance, field position, score, personnel,
+    shotgun, etc.) on 2019-2023 PBP and evaluated on the held-out 2024
+    season. Team accuracy = how often the model's predicted call matched
+    the offense's actual call; low accuracy = the offense defies typical
+    situational tendencies more often.
+    """
+    ml_dir = os.path.join(os.path.dirname(__file__), "ml", "play_prediction_output")
+    metrics_file = os.path.join(ml_dir, "metrics.json")
+    ranking_file = os.path.join(ml_dir, "predictability_ranking.csv")
+    if not os.path.exists(metrics_file) or not os.path.exists(ranking_file):
+        raise HTTPException(status_code=503, detail="Play predictability model not generated yet. Run backend/ml/play_prediction.py.")
+
+    with open(metrics_file) as f:
+        metrics = json.load(f)
+
+    ranking_df = pd.read_csv(ranking_file)
+    teams = ranking_df.to_dict(orient="records")
+
+    return {
+        "train_years": metrics["train_years"],
+        "test_year": metrics["test_year"],
+        "n_train": metrics["n_train"],
+        "n_test": metrics["n_test"],
+        "overall": {
+            "accuracy": metrics["accuracy"],
+            "auc": metrics["auc"],
+            "log_loss": metrics["log_loss"],
+            "majority_class_baseline": metrics["majority_class_baseline"],
+        },
+        "teams": teams,
+        "feature_importance": metrics["feature_importance"],
+        "pass_rate_by_down": metrics["pass_rate_by_down"],
+    }
 
 
 # ── Static files (React build) ───────────────────────────────────────────────
