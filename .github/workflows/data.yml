@@ -1,0 +1,41 @@
+# Rebuilds the stats BetTracker reads (pipeline/build.py) from nflverse's daily
+# releases and publishes them to the `data` branch, served from
+# https://raw.githubusercontent.com/hbirk01/NFL-stats/data/<file>.json
+name: Publish data
+
+on:
+  schedule:
+    # nflverse refreshes overnight; again Monday/Tuesday mornings after the weekend's games.
+    - cron: "30 11 * * *"
+    - cron: "30 15 * * 1,2"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-data
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pipeline/requirements.txt
+      - run: pip install -r pipeline/requirements.txt
+      - run: python pipeline/build.py --out dist
+      - name: Publish to the data branch
+        run: |
+          cd dist
+          git init -q -b data
+          git config user.name "github-actions[bot]"
+          git config user.email "41898+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -qm "Data $(date -u +%Y-%m-%dT%H:%MZ)"
+          # One commit, replaced each run: the branch only ever holds the latest data.
+          git push -q --force "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" data
