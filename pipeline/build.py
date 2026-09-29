@@ -442,6 +442,12 @@ def main():
 
     # Latest roster row per player.
     roster = roster.sort_values("week").drop_duplicates("gsis_id", keep="last")
+    # Sleeper ids -> who they are, for fantasy rosters (kickers too; defenses are team codes).
+    fantasy = roster[roster["position"].isin(SKILL + ["K"]) & roster["sleeper_id"].notna()]
+    sleeper_map = {
+        str(r["sleeper_id"]): {"name": r["full_name"], "pos": r["position"], "team": r["team"], **({"id": r["gsis_id"]} if pd.notna(r["gsis_id"]) else {})}
+        for _, r in fantasy.iterrows()
+    }
     roster = roster[roster["position"].isin(SKILL) & roster["gsis_id"].notna()]
     pos_of = dict(zip(roster["gsis_id"], roster["position"]))
 
@@ -482,10 +488,20 @@ def main():
         if t is None and not has_routes:
             continue
         season_line = {k: num(t[k], 1 if k.startswith("fp") else 0) for k in totals.columns if k not in ("pos", "pos_rank")} if t is not None else None
+
+        team = r["team"]
+        nxt = upcoming[(upcoming["home_team"] == team) | (upcoming["away_team"] == team)].sort_values("week").head(5)
+        ahead = []
+        for _, g in nxt.iterrows():
+            opp = g["away_team"] if g["home_team"] == team else g["home_team"]
+            d = rank_of.get(pos, {}).get(opp, {})
+            ahead.append({"week": int(g["week"]), "opp": opp, "home": g["home_team"] == team, "day": g["gameday"], "rank": d.get("rank"), "ppg": d.get("ppg")})
         entry = {
             "id": pid, "name": r["full_name"], "pos": pos, "team": r["team"], "espn": str(int(r["espn_id"])) if pd.notna(r["espn_id"]) else None,
             "sleeper": str(r["sleeper_id"]) if pd.notna(r["sleeper_id"]) else None, "headshot": r["headshot_url"] if pd.notna(r["headshot_url"]) else None,
             "s": season_line, "rank": num(t["pos_rank"], 0) if t is not None else None,
+            # Next game and how that defense ranks vs the position (for fantasy lineups).
+            "next": {k: ahead[0][k] for k in ("week", "opp", "home", "rank")} if ahead else None,
         }
         index.append(entry)
 
@@ -496,13 +512,6 @@ def main():
                 "att", "cmp", "pass_yds", "pass_td", "ints", "sacks", "car", "rush_yds", "rush_td", "long_rush", "tgt", "rec", "rec_yds", "rec_td", "long_rec", "fp_ppr", "fp_half")},
         } for _, g in log.iterrows()]
 
-        team = r["team"]
-        nxt = upcoming[(upcoming["home_team"] == team) | (upcoming["away_team"] == team)].sort_values("week").head(5)
-        ahead = []
-        for _, g in nxt.iterrows():
-            opp = g["away_team"] if g["home_team"] == team else g["home_team"]
-            d = rank_of.get(pos, {}).get(opp, {})
-            ahead.append({"week": int(g["week"]), "opp": opp, "home": g["home_team"] == team, "day": g["gameday"], "rank": d.get("rank"), "ppg": d.get("ppg")})
         faced = [{"week": x["week"], "opp": x["opp"], "rank": rank_of.get(pos, {}).get(x["opp"], {}).get("rank")} for x in game_log]
 
         page = {
@@ -522,6 +531,7 @@ def main():
     index.sort(key=lambda e: -((e["s"] or {}).get("fp_ppr") or 0))
     write(out / "index.json", index)
     write(out / "defense.json", defense)
+    write(out / "sleeper.json", sleeper_map)
     write(out / "meta.json", {
         "generated": now.isoformat(timespec="seconds"), "season": season, "week": week,
         "routes_season": part_season if rp["routes"] else None, "players": len(index),
