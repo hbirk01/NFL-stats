@@ -61,11 +61,16 @@ def read(raw: Path, rel: str) -> pd.DataFrame | None:
 
 def real_plays(pbp: pd.DataFrame) -> pd.DataFrame:
     """Regular-season scrimmage plays that count: no penalties-nullified plays, no two-point tries."""
-    return pbp[
+    plays = pbp[
         (pbp["season_type"] == "REG")
         & pbp["play_type"].isin(["pass", "run", "qb_kneel", "qb_spike"])
         & (pbp["two_point_attempt"].fillna(0) == 0)
     ].copy()
+    # The quarterback on a dropback: the passer, or the rusher on a scramble.
+    plays["qb_id"] = plays["passer_player_id"].where(
+        plays["passer_player_id"].notna(), plays["rusher_player_id"].where(plays["qb_scramble"] == 1)
+    )
+    return plays
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -207,8 +212,8 @@ def advanced_tables(plays: pd.DataFrame, ftn: pd.DataFrame | None, ngs: dict, se
     out: dict[str, dict] = {}
 
     # QB
-    drop = p[(p["qb_dropback"] == 1) & p["passer_player_id"].notna()]
-    for pid, g in drop.groupby("passer_player_id"):
+    drop = p[(p["qb_dropback"] == 1) & p["qb_id"].notna()]
+    for pid, g in drop.groupby("qb_id"):
         att = g[(g["pass_attempt"] == 1) & (g["sack"] != 1)]
         m = {
             "dropbacks": len(g),
@@ -225,8 +230,8 @@ def advanced_tables(plays: pd.DataFrame, ftn: pd.DataFrame | None, ngs: dict, se
         }
         out.setdefault(pid, {}).update(m)
     if fp is not None:
-        qb = fp[(fp["qb_dropback"] == 1) & fp["passer_player_id"].notna()]
-        for pid, g in qb.groupby("passer_player_id"):
+        qb = fp[(fp["qb_dropback"] == 1) & fp["qb_id"].notna()]
+        for pid, g in qb.groupby("qb_id"):
             out.setdefault(pid, {})["pa_rate"] = ratio(g["is_play_action"].sum(), len(g), 100)
 
     # Rushers
@@ -359,8 +364,8 @@ def route_trees(pbp: pd.DataFrame, part: pd.DataFrame) -> dict:
         trees[pid] = {"routes": rows, "man": split(man), "zone": split(zone)}
 
     pressure = {}
-    qb = j[j["passer_player_id"].notna() & (j["qb_dropback"] == 1) & j["was_pressure"].notna()]
-    for pid, g in qb.groupby("passer_player_id"):
+    qb = j[j["qb_id"].notna() & (j["qb_dropback"] == 1) & j["was_pressure"].notna()]
+    for pid, g in qb.groupby("qb_id"):
         def split(d):
             a = d[(d["pass_attempt"] == 1) & (d["sack"] != 1)]
             return {
@@ -380,8 +385,8 @@ def blitz_splits(plays: pd.DataFrame, ftn: pd.DataFrame | None) -> dict:
         return {}
     j = plays.merge(ftn.rename(columns={"nflverse_game_id": "game_id", "nflverse_play_id": "play_id"})[["game_id", "play_id", "n_blitzers", "is_play_action"]], on=["game_id", "play_id"], how="inner")
     out = {}
-    qb = j[j["passer_player_id"].notna() & (j["qb_dropback"] == 1)]
-    for pid, g in qb.groupby("passer_player_id"):
+    qb = j[j["qb_id"].notna() & (j["qb_dropback"] == 1)]
+    for pid, g in qb.groupby("qb_id"):
         def split(d):
             a = d[(d["pass_attempt"] == 1) & (d["sack"] != 1)]
             return {"db": len(d), "cmp_pct": ratio(a["complete_pass"].sum(), len(a), 100), "ypa": ratio(a["passing_yards"].sum(), len(a)), "epa_db": ratio(d["epa"].sum(), len(d), nd=3), "sacks": int(d["sack"].sum())}
