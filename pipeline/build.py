@@ -433,7 +433,7 @@ def scheme_tables(pbp: pd.DataFrame, part: pd.DataFrame) -> dict:
     return {"schemes": schemes, "routes": routes}
 
 
-def cornerbacks(raw: Path, season: int, roster_all: pd.DataFrame, scheme: dict, scheme_season: int | None) -> dict | None:
+def cornerbacks(raw: Path, season: int, roster_all: pd.DataFrame, scheme: dict, scheme_season: int | None, injuries: dict | None = None) -> dict | None:
     """
     Every team's starting corners (depth chart) with their coverage this season
     (PFR, weekly) and last, a 0-100 coverage score, and the defense's scheme.
@@ -507,6 +507,7 @@ def cornerbacks(raw: Path, season: int, roster_all: pd.DataFrame, scheme: dict, 
                 "slot": r["pos_abb"], "name": r["player_name"], "id": gsis if pd.notna(gsis) else None,
                 "headshot": info["headshot_url"] if info is not None and pd.notna(info.get("headshot_url")) else None,
                 "cur": now, "prev": last, "quality": num(q, 0), "grade": grade(q),
+                **({"inj": injuries[gsis]} if injuries and pd.notna(gsis) and gsis in injuries else {}),
             }
             corners.append(corner)
             if q is not None:
@@ -556,6 +557,32 @@ def rushing_detail(plays: pd.DataFrame) -> dict:
     return out
 
 
+# ── Injuries ─────────────────────────────────────────────────────────────────
+
+def injury_map(inj: pd.DataFrame | None) -> dict:
+    """
+    Game status from the latest weekly injury report (Out / Doubtful /
+    Questionable), with the injury and practice participation. Players listed
+    only as practicing fully aren't included.
+    """
+    if inj is None or not len(inj):
+        return {}
+    latest = inj[inj["week"] == inj["week"].max()]
+    out = {}
+    for _, r in latest.iterrows():
+        status = r.get("report_status")
+        if not isinstance(status, str) or not status or pd.isna(r.get("gsis_id")):
+            continue
+        practice = r.get("practice_status")
+        out[r["gsis_id"]] = {
+            "status": status,
+            "injury": r.get("report_primary_injury") if isinstance(r.get("report_primary_injury"), str) else None,
+            "practice": (practice or "").replace(" in Practice", "").replace(" In Practice", "") or None if isinstance(practice, str) else None,
+            "week": int(r["week"]),
+        }
+    return out
+
+
 # ── Build ────────────────────────────────────────────────────────────────────
 
 def main():
@@ -579,6 +606,7 @@ def main():
     ftn = read(raw, f"ftn_charting/ftn_charting_{season}.parquet")
     ngs = {k: read(raw, f"nextgen_stats/ngs_{k}.parquet") for k in ("passing", "receiving", "rushing")}
     schedule = read(raw, GAMES_CSV)
+    injuries = injury_map(read(raw, f"injuries/injuries_{season}.parquet"))
 
     plays = real_plays(pbp)
     week = int(plays["week"].max())
@@ -590,7 +618,11 @@ def main():
     # Sleeper ids -> who they are, for fantasy rosters (kickers too; defenses are team codes).
     fantasy = roster[roster["position"].isin(SKILL + ["K"]) & roster["sleeper_id"].notna()]
     sleeper_map = {
-        str(r["sleeper_id"]): {"name": r["full_name"], "pos": r["position"], "team": r["team"], **({"id": r["gsis_id"]} if pd.notna(r["gsis_id"]) else {})}
+        str(r["sleeper_id"]): {
+            "name": r["full_name"], "pos": r["position"], "team": r["team"],
+            **({"id": r["gsis_id"]} if pd.notna(r["gsis_id"]) else {}),
+            **({"inj": injuries[r["gsis_id"]]} if r["gsis_id"] in injuries else {}),
+        }
         for _, r in fantasy.iterrows()
     }
     roster = roster[roster["position"].isin(SKILL) & roster["gsis_id"].notna()]
@@ -611,7 +643,7 @@ def main():
         part_pbp = read(raw, f"pbp/play_by_play_{part_season}.parquet")
     have_part = part is not None and part_pbp is not None
     rp = route_trees(part_pbp, part) if have_part else {"routes": {}, "pressure": {}}
-    cbs = cornerbacks(raw, season, roster_all, scheme_tables(part_pbp, part) if have_part else {}, part_season if have_part else None)
+    cbs = cornerbacks(raw, season, roster_all, scheme_tables(part_pbp, part) if have_part else {}, part_season if have_part else None, injuries)
 
     # Upcoming games, for schedule difficulty.
     sched = schedule[(schedule["season"] == season) & (schedule["game_type"] == "REG")]
@@ -649,6 +681,8 @@ def main():
             "s": season_line, "rank": num(t["pos_rank"], 0) if t is not None else None,
             # Next game and how that defense ranks vs the position (for fantasy lineups).
             "next": {k: ahead[0][k] for k in ("week", "opp", "home", "rank")} if ahead else None,
+            # Latest injury report status, when listed.
+            **({"inj": injuries[pid]} if pid in injuries else {}),
         }
         index.append(entry)
 
