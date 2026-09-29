@@ -379,6 +379,146 @@ def route_trees(pbp: pd.DataFrame, part: pd.DataFrame) -> dict:
     return {"routes": trees, "pressure": pressure}
 
 
+# ── Cornerbacks ──────────────────────────────────────────────────────────────
+
+CB_SLOTS = {"LCB": "Left CB", "RCB": "Right CB", "NB": "Slot CB"}
+MAN_TYPES = {"MAN_COVERAGE"}
+
+
+def passer_rating(att, cmp, yds, td, ints):
+    """NFL passer rating from totals (targets as attempts), 0-158.3."""
+    if not att:
+        return None
+    clamp = lambda x: max(0.0, min(2.375, x))
+    a = clamp((cmp / att - 0.3) * 5)
+    b = clamp((yds / att - 3) * 0.25)
+    c = clamp(td / att * 20)
+    d = clamp(2.375 - ints / att * 25)
+    return round((a + b + c + d) / 6 * 100, 1)
+
+
+def coverage_line(tgt, cmp, yds, td, ints, games, air=None):
+    return {
+        "g": int(games), "tgt": int(tgt), "cmp": int(cmp), "yds": int(yds), "td": int(td), "int": int(ints),
+        "cmp_pct": ratio(cmp, tgt, 100), "ypt": ratio(yds, tgt), "rat": passer_rating(tgt, cmp, yds, td, ints),
+        **({"adot": ratio(air, tgt)} if air is not None else {}),
+    }
+
+
+def scheme_tables(pbp: pd.DataFrame, part: pd.DataFrame) -> dict:
+    """Each defense's man/zone mix and coverage shells, and how every route does vs man and zone, league-wide."""
+    j = real_plays(pbp).merge(
+        part.rename(columns={"nflverse_game_id": "game_id"})[["game_id", "play_id", "route", "defense_man_zone_type", "defense_coverage_type"]],
+        on=["game_id", "play_id"], how="inner",
+    )
+    drop = j[(j["qb_dropback"] == 1) & j["defense_man_zone_type"].isin(["MAN_COVERAGE", "ZONE_COVERAGE"])]
+    schemes = {}
+    for team, g in drop.groupby("defteam"):
+        n = len(g)
+        shells = g["defense_coverage_type"].dropna().value_counts()
+        schemes[team] = {
+            "man": ratio((g["defense_man_zone_type"] == "MAN_COVERAGE").sum(), n, 100),
+            "zone": ratio((g["defense_man_zone_type"] == "ZONE_COVERAGE").sum(), n, 100),
+            "plays": n,
+            "shells": [{"type": t, "pct": ratio(c, shells.sum(), 100)} for t, c in shells.head(4).items()],
+        }
+    routes = {}
+    tg = drop[drop["receiver_player_id"].notna() & (drop["pass_attempt"] == 1) & drop["route"].notna() & (drop["route"] != "")]
+    for route, g in tg.groupby("route"):
+        row = {}
+        for label, cov in (("man", "MAN_COVERAGE"), ("zone", "ZONE_COVERAGE")):
+            d = g[g["defense_man_zone_type"] == cov]
+            row[label] = {"tgt": len(d), "ypt": ratio(d["receiving_yards"].fillna(0).sum(), len(d)), "cmp_pct": ratio(d["complete_pass"].sum(), len(d), 100), "epa": ratio(d["epa"].sum(), len(d), nd=3)}
+        routes[route] = row
+    return {"schemes": schemes, "routes": routes}
+
+
+def cornerbacks(raw: Path, season: int, roster_all: pd.DataFrame, scheme: dict, scheme_season: int | None, injuries: dict | None = None) -> dict | None:
+    """
+    Every team's starting corners (depth chart) with their coverage this season
+    (PFR, weekly) and last, a 0-100 coverage score, and the defense's scheme.
+    """
+    weekly = read(raw, f"pfr_advstats/advstats_week_def_{season}.parquet")
+    depth = read(raw, f"depth_charts/depth_charts_{season}.parquet")
+    seasons = read(raw, "pfr_advstats/advstats_season_def.parquet")
+    if weekly is None or depth is None:
+        return None
+
+    weekly = weekly[weekly["game_type"] == "REG"] if "game_type" in weekly else weekly
+    cur = weekly.groupby("pfr_player_id").agg(
+        g=("week", "nunique"), tgt=("def_targets", "sum"), cmp=("def_completions_allowed", "sum"), yds=("def_yards_allowed", "sum"),
+        td=("def_receiving_td_allowed", "sum"), ints=("def_ints", "sum"),
+        air=("def_adot", lambda s: (s.fillna(0) * weekly.loc[s.index, "def_targets"].fillna(0)).sum()),
+    ).fillna(0)
+    prev = pd.DataFrame()
+    if seasons is not None:
+        prev = seasons[(seasons["season"] == season - 1)].groupby("pfr_id").agg(
+            g=("g", "sum"), tgt=("tgt", "sum"), cmp=("cmp", "sum"), yds=("yds", "sum"), td=("td", "sum"), ints=("int", "sum"), pos=("pos", "first")
+        ).fillna(0)
+
+    # Latest depth chart: the starter at each corner spot.
+    depth = depth[depth["dt"] == depth["dt"].max()]
+    starters = depth[depth["pos_abb"].isin(CB_SLOTS.keys()) & (depth["pos_rank"] == 1)]
+    ids = roster_all.dropna(subset=["gsis_id"]).drop_duplicates("gsis_id").set_index("gsis_id")
+
+    def lines_for(pfr):
+        c = cur.loc[pfr] if pfr in cur.index else None
+        p = prev.loc[pfr] if pfr in prev.index else None
+        return (
+            coverage_line(c["tgt"], c["cmp"], c["yds"], c["td"], c["ints"], c["g"], c["air"]) if c is not None and c["tgt"] > 0 else None,
+            coverage_line(p["tgt"], p["cmp"], p["yds"], p["td"], p["ints"], p["g"]) if p is not None and p["tgt"] > 0 else None,
+        )
+
+    # Coverage score: yards/target, completion % and passer rating allowed, this
+    # season plus half of last (early-season samples are tiny), ranked among
+    # every corner with enough targets. 100 = the stingiest.
+    # Corners only (the weekly file has every defender): on a roster as a CB now, or listed as one last season.
+    cb_ids = set(roster_all.loc[roster_all["position"] == "CB", "pfr_id"].dropna())
+    if len(prev):
+        cb_ids |= set(prev[prev["pos"] == "CB"].index)
+    pool_ids = (set(cur.index) | set(prev.index)) & cb_ids
+    blended = {}
+    for pfr in pool_ids:
+        c = cur.loc[pfr] if pfr in cur.index else None
+        p = prev.loc[pfr] if pfr in prev.index else None
+        tot = {k: (c[k] if c is not None else 0) + 0.5 * (p[k] if p is not None else 0) for k in ("tgt", "cmp", "yds", "td", "ints")}
+        if tot["tgt"] >= 12:
+            blended[pfr] = (tot["yds"] / tot["tgt"], tot["cmp"] / tot["tgt"], passer_rating(tot["tgt"], tot["cmp"], tot["yds"], tot["td"], tot["ints"]))
+    score = {}
+    if blended:
+        frame = pd.DataFrame.from_dict(blended, orient="index", columns=["ypt", "cmp", "rat"])
+        z = -((frame - frame.mean()) / frame.std(ddof=0)).mean(axis=1)
+        score = (z.rank(pct=True) * 100).round().to_dict()
+
+    def grade(q):
+        return None if q is None else "A" if q >= 80 else "B" if q >= 60 else "C" if q >= 40 else "D" if q >= 20 else "F"
+
+    teams = {}
+    rankings = []
+    for team, g in starters.groupby("team"):
+        corners = []
+        for _, r in g.sort_values("pos_slot").iterrows():
+            gsis = r.get("gsis_id")
+            info = ids.loc[gsis] if pd.notna(gsis) and gsis in ids.index else None
+            pfr = info["pfr_id"] if info is not None and pd.notna(info.get("pfr_id")) else None
+            now, last = lines_for(pfr) if pfr else (None, None)
+            q = score.get(pfr)
+            corner = {
+                "slot": r["pos_abb"], "name": r["player_name"], "id": gsis if pd.notna(gsis) else None,
+                "headshot": info["headshot_url"] if info is not None and pd.notna(info.get("headshot_url")) else None,
+                "cur": now, "prev": last, "quality": num(q, 0), "grade": grade(q),
+                **({"inj": injuries[gsis]} if injuries and pd.notna(gsis) and gsis in injuries else {}),
+            }
+            corners.append(corner)
+            if q is not None:
+                rankings.append({"team": team, **{k: corner[k] for k in ("slot", "name", "id", "quality", "grade")}, "tgt": (now or {}).get("tgt", 0), "ypt": (now or {}).get("ypt"), "rat": (now or {}).get("rat")})
+        order = {"LCB": 0, "RCB": 1, "NB": 2}
+        corners.sort(key=lambda c: order.get(c["slot"], 9))
+        teams[team] = {"corners": corners, "scheme": scheme.get("schemes", {}).get(team)}
+    rankings.sort(key=lambda x: -(x["quality"] or 0))
+    return {"season": season, "scheme_season": scheme_season, "teams": teams, "routes": scheme.get("routes", {}), "rankings": rankings}
+
+
 def blitz_splits(plays: pd.DataFrame, ftn: pd.DataFrame | None) -> dict:
     """This season's QB splits vs the blitz and with play action (FTN charting, published weekly)."""
     if ftn is None or not len(ftn):
@@ -417,6 +557,32 @@ def rushing_detail(plays: pd.DataFrame) -> dict:
     return out
 
 
+# ── Injuries ─────────────────────────────────────────────────────────────────
+
+def injury_map(inj: pd.DataFrame | None) -> dict:
+    """
+    Game status from the latest weekly injury report (Out / Doubtful /
+    Questionable), with the injury and practice participation. Players listed
+    only as practicing fully aren't included.
+    """
+    if inj is None or not len(inj):
+        return {}
+    latest = inj[inj["week"] == inj["week"].max()]
+    out = {}
+    for _, r in latest.iterrows():
+        status = r.get("report_status")
+        if not isinstance(status, str) or not status or pd.isna(r.get("gsis_id")):
+            continue
+        practice = r.get("practice_status")
+        out[r["gsis_id"]] = {
+            "status": status,
+            "injury": r.get("report_primary_injury") if isinstance(r.get("report_primary_injury"), str) else None,
+            "practice": (practice or "").replace(" in Practice", "").replace(" In Practice", "") or None if isinstance(practice, str) else None,
+            "week": int(r["week"]),
+        }
+    return out
+
+
 # ── Build ────────────────────────────────────────────────────────────────────
 
 def main():
@@ -440,6 +606,7 @@ def main():
     ftn = read(raw, f"ftn_charting/ftn_charting_{season}.parquet")
     ngs = {k: read(raw, f"nextgen_stats/ngs_{k}.parquet") for k in ("passing", "receiving", "rushing")}
     schedule = read(raw, GAMES_CSV)
+    injuries = injury_map(read(raw, f"injuries/injuries_{season}.parquet"))
 
     plays = real_plays(pbp)
     week = int(plays["week"].max())
@@ -447,10 +614,15 @@ def main():
 
     # Latest roster row per player.
     roster = roster.sort_values("week").drop_duplicates("gsis_id", keep="last")
+    roster_all = roster
     # Sleeper ids -> who they are, for fantasy rosters (kickers too; defenses are team codes).
     fantasy = roster[roster["position"].isin(SKILL + ["K"]) & roster["sleeper_id"].notna()]
     sleeper_map = {
-        str(r["sleeper_id"]): {"name": r["full_name"], "pos": r["position"], "team": r["team"], **({"id": r["gsis_id"]} if pd.notna(r["gsis_id"]) else {})}
+        str(r["sleeper_id"]): {
+            "name": r["full_name"], "pos": r["position"], "team": r["team"],
+            **({"id": r["gsis_id"]} if pd.notna(r["gsis_id"]) else {}),
+            **({"inj": injuries[r["gsis_id"]]} if r["gsis_id"] in injuries else {}),
+        }
         for _, r in fantasy.iterrows()
     }
     roster = roster[roster["position"].isin(SKILL) & roster["gsis_id"].notna()]
@@ -469,7 +641,9 @@ def main():
         part_season = season - 1
         part = read(raw, f"pbp_participation/pbp_participation_{part_season}.parquet")
         part_pbp = read(raw, f"pbp/play_by_play_{part_season}.parquet")
-    rp = route_trees(part_pbp, part) if part is not None and part_pbp is not None else {"routes": {}, "pressure": {}}
+    have_part = part is not None and part_pbp is not None
+    rp = route_trees(part_pbp, part) if have_part else {"routes": {}, "pressure": {}}
+    cbs = cornerbacks(raw, season, roster_all, scheme_tables(part_pbp, part) if have_part else {}, part_season if have_part else None, injuries)
 
     # Upcoming games, for schedule difficulty.
     sched = schedule[(schedule["season"] == season) & (schedule["game_type"] == "REG")]
@@ -507,6 +681,8 @@ def main():
             "s": season_line, "rank": num(t["pos_rank"], 0) if t is not None else None,
             # Next game and how that defense ranks vs the position (for fantasy lineups).
             "next": {k: ahead[0][k] for k in ("week", "opp", "home", "rank")} if ahead else None,
+            # Latest injury report status, when listed.
+            **({"inj": injuries[pid]} if pid in injuries else {}),
         }
         index.append(entry)
 
@@ -537,6 +713,8 @@ def main():
     write(out / "index.json", index)
     write(out / "defense.json", defense)
     write(out / "sleeper.json", sleeper_map)
+    if cbs:
+        write(out / "cornerbacks.json", cbs)
     write(out / "meta.json", {
         "generated": now.isoformat(timespec="seconds"), "season": season, "week": week,
         "routes_season": part_season if rp["routes"] else None, "players": len(index),
