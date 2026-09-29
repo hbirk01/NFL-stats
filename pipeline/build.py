@@ -193,6 +193,28 @@ def defense_vs_position(lines: pd.DataFrame, pos_of: dict) -> dict:
     return out
 
 
+def defense_outlook(current: dict, previous: dict | None, week: int) -> dict:
+    """
+    Adds a rest-of-season rank to each defense-vs-position row: this season's
+    points allowed blended with last season's, leaning on this season more as
+    it goes (3 weeks in, a third this season). Early-season ranks alone are
+    mostly noise. `rank` stays this season's.
+    """
+    w = week / (week + 6)
+    out = {}
+    for pos, rows in current.items():
+        prev = {r["team"]: r["ppg"] for r in (previous or {}).get(pos, [])}
+        blended = []
+        for r in rows:
+            last = prev.get(r["team"])
+            ros = r["ppg"] if last is None or r["ppg"] is None else w * r["ppg"] + (1 - w) * last
+            blended.append({**r, "ppg_prev": last, "ppg_ros": num(ros, 1)})
+        for i, r in enumerate(sorted(blended, key=lambda r: -(r["ppg_ros"] or 0))):
+            r["rank_ros"] = i + 1
+        out[pos] = blended
+    return out
+
+
 # ── Advanced metrics ─────────────────────────────────────────────────────────
 
 def advanced_tables(plays: pd.DataFrame, ftn: pd.DataFrame | None, ngs: dict, season: int) -> dict:
@@ -628,7 +650,14 @@ def main():
     roster = roster[roster["position"].isin(SKILL) & roster["gsis_id"].notna()]
     pos_of = dict(zip(roster["gsis_id"], roster["position"]))
 
-    defense = defense_vs_position(lines, pos_of)
+    # Last season too: early this season, who a defense has faced says more than how it's done.
+    prev_pbp = read(raw, f"pbp/play_by_play_{season - 1}.parquet")
+    prev_roster = read(raw, f"rosters/roster_{season - 1}.parquet")
+    prev_defense = None
+    if prev_pbp is not None and prev_roster is not None:
+        prev_pos = dict(zip(prev_roster["gsis_id"], prev_roster["position"]))
+        prev_defense = defense_vs_position(game_lines(real_plays(prev_pbp), prev_pbp), prev_pos)
+    defense = defense_outlook(defense_vs_position(lines, pos_of), prev_defense, week)
     rank_of = {pos: {r["team"]: r for r in rows} for pos, rows in defense.items()}
     adv = with_percentiles(advanced_tables(plays, ftn, ngs, season), pos_of, week)
     blitz = blitz_splits(plays, ftn)
@@ -674,7 +703,8 @@ def main():
         for _, g in nxt.iterrows():
             opp = g["away_team"] if g["home_team"] == team else g["home_team"]
             d = rank_of.get(pos, {}).get(opp, {})
-            ahead.append({"week": int(g["week"]), "opp": opp, "home": g["home_team"] == team, "day": g["gameday"], "rank": d.get("rank"), "ppg": d.get("ppg")})
+            # Looking ahead, the rest-of-season rank (this season blended with last).
+            ahead.append({"week": int(g["week"]), "opp": opp, "home": g["home_team"] == team, "day": g["gameday"], "rank": d.get("rank_ros"), "ppg": d.get("ppg_ros")})
         entry = {
             "id": pid, "name": r["full_name"], "pos": pos, "team": r["team"], "espn": str(int(r["espn_id"])) if pd.notna(r["espn_id"]) else None,
             "sleeper": str(r["sleeper_id"]) if pd.notna(r["sleeper_id"]) else None, "headshot": r["headshot_url"] if pd.notna(r["headshot_url"]) else None,
@@ -712,6 +742,12 @@ def main():
     index.sort(key=lambda e: -((e["s"] or {}).get("fp_ppr") or 0))
     write(out / "index.json", index)
     write(out / "defense.json", defense)
+    # Every team's regular season, week by week (byes are the missing weeks).
+    team_weeks = {}
+    for _, g in sched.sort_values("week").iterrows():
+        for team, opp, home in ((g["home_team"], g["away_team"], True), (g["away_team"], g["home_team"], False)):
+            team_weeks.setdefault(team, []).append({"week": int(g["week"]), "opp": opp, "home": home, "day": g["gameday"]})
+    write(out / "schedule.json", {"season": season, "weeks": int(sched["week"].max()), "teams": team_weeks})
     write(out / "sleeper.json", sleeper_map)
     if cbs:
         write(out / "cornerbacks.json", cbs)
