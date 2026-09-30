@@ -629,6 +629,7 @@ def main():
     ngs = {k: read(raw, f"nextgen_stats/ngs_{k}.parquet") for k in ("passing", "receiving", "rushing")}
     schedule = read(raw, GAMES_CSV)
     injuries = injury_map(read(raw, f"injuries/injuries_{season}.parquet"))
+    snaps = read(raw, f"snap_counts/snap_counts_{season}.parquet")
 
     plays = real_plays(pbp)
     week = int(plays["week"].max())
@@ -687,6 +688,17 @@ def main():
     totals["pos"] = totals.index.map(pos_of)
     totals["pos_rank"] = totals.groupby("pos")["fp_ppr"].rank(ascending=False, method="min")
 
+    # Weekly usage, for spotting rising roles: offensive snap share (by PFR id, via
+    # the roster), targets and carries.
+    snap_pct = {}
+    if snaps is not None:
+        pfr_to_gsis = dict(zip(roster_all["pfr_id"], roster_all["gsis_id"]))
+        reg = snaps[snaps["game_type"] == "REG"] if "game_type" in snaps else snaps
+        for _, r in reg.iterrows():
+            gsis = pfr_to_gsis.get(r["pfr_player_id"])
+            if gsis:
+                snap_pct[(gsis, int(r["week"]))] = round(float(r["offense_pct"] or 0) * 100)
+
     index = []
     players_dir = out / "players"
     for _, r in roster.iterrows():
@@ -714,6 +726,16 @@ def main():
             # Latest injury report status, when listed.
             **({"inj": injuries[pid]} if pid in injuries else {}),
         }
+        mine = lines[lines["id"] == pid]
+        by_week = {int(g["week"]): g for _, g in mine.iterrows()}
+        weeks_played = sorted(set(by_week) | {w for (i, w) in snap_pct if i == pid})
+        if weeks_played:
+            entry["use"] = {
+                "w": weeks_played,
+                "snap": [snap_pct.get((pid, w)) for w in weeks_played],
+                "tgt": [int(by_week[w]["tgt"]) if w in by_week else 0 for w in weeks_played],
+                "car": [int(by_week[w]["car"]) if w in by_week else 0 for w in weeks_played],
+            }
         index.append(entry)
 
         log = lines[lines["id"] == pid].sort_values("week")
