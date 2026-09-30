@@ -771,6 +771,15 @@ def main():
             team_weeks.setdefault(team, []).append({"week": int(g["week"]), "opp": opp, "home": home, "day": g["gameday"]})
     write(out / "schedule.json", {"season": season, "weeks": int(sched["week"].max()), "teams": team_weeks})
     write(out / "sleeper.json", sleeper_map)
+    # The model's number on every upcoming game. Never fails the build.
+    try:
+        from predictions import predictions
+
+        model = predictions(raw, season, now)
+        if model:
+            write(out / "model.json", model)
+    except Exception as e:  # noqa: BLE001
+        print(f"  model predictions skipped: {e}")
     if cbs:
         write(out / "cornerbacks.json", cbs)
     write(out / "meta.json", {
