@@ -1,0 +1,35 @@
+# The BetTracker model's live picks (pipeline/picks.py), posted as the Model
+# account. Runs every 3 hours; each run bets games starting within 36 hours
+# that it hasn't bet yet, so picks land about a day before kickoff.
+#
+# Repository secrets (Settings -> Secrets and variables -> Actions):
+#   SUPABASE_URL               https://<project>.supabase.co
+#   SUPABASE_SERVICE_ROLE_KEY  the service_role key (Supabase -> Project Settings -> API)
+#   MODEL_USER_ID              the Model account's user id (Supabase -> Authentication -> Users)
+name: Model picks
+
+on:
+  schedule:
+    - cron: "15 */3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: model-picks
+  cancel-in-progress: false
+
+jobs:
+  picks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pipeline/requirements.txt
+      - run: pip install -r pipeline/requirements.txt
+      - run: python pipeline/picks.py
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          MODEL_USER_ID: ${{ secrets.MODEL_USER_ID }}
