@@ -2,7 +2,7 @@
 # account. Runs every 3 hours; each run bets games starting within 36 hours
 # that it hasn't bet yet, so picks land about a day before kickoff.
 #
-# Repository secrets (Settings -> Secrets and variables -> Actions):
+# Secrets on the Production environment (Settings -> Environments -> Production):
 #   SUPABASE_URL               https://<project>.supabase.co
 #   SUPABASE_SERVICE_ROLE_KEY  the service_role key (Supabase -> Project Settings -> API)
 #   MODEL_USER_ID              the Model account's user id (Supabase -> Authentication -> Users)
@@ -20,6 +20,8 @@ concurrency:
 jobs:
   picks:
     runs-on: ubuntu-latest
+    # The secrets live on the Production environment.
+    environment: Production
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
