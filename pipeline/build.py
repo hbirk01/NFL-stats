@@ -786,7 +786,11 @@ def main():
 
         up = props.upcoming(raw, season, schedule)
         if up:
-            up.pop("_proj", None)
+            # Every projected player's averages (ESPN id -> stat -> mean) and how results spread
+            # around them, so the app can price any line (a parlay leg, a milestone), not just DraftKings'.
+            proj = up.pop("_proj", {})
+            up["proj"] = {e: {k: round(v, 2) for k, v in x.items() if k in props.PROP_STATS} for e, x in proj.items()}
+            up["spread"] = json.loads(props.SPREAD_FILE.read_text())
             n = props.archive(out, up["season"], up["week"], up.pop("_lines"), schedule)
             try:
                 props.with_confidence(up, raw, up["season"], schedule, out / "props-lines")
