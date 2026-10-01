@@ -12,8 +12,8 @@ from datetime import datetime, timedelta
 import pandas as pd
 
 from build import injury_map, read
-from model import GAMES_CSV, Params, Ratings, fit, load, pbp_for, predict, run, summarize, team_games, win_prob
-from picks import SPREAD_EDGE, TOTAL_EDGE, espn_week, kickoff_weather
+from model import GAMES_CSV, Params, Ratings, fit, live_offset, live_params, load, pbp_for, predict, run, summarize, team_games, week_starters, win_prob
+from picks import espn_week, kickoff_weather
 
 WEATHER_WITHIN = timedelta(hours=72)  # Open-Meteo's forecast reach, roughly
 
@@ -36,7 +36,8 @@ def predictions(raw, season: int, now: datetime, weeks_ahead: int = 2) -> dict |
             espn = espn_week(season, week)
         except Exception:
             espn = {}
-        at = ratings.at(week)
+        at = ratings.at(week, week_starters(upcoming[upcoming["week"] == week]))
+        offset = live_offset(games, tg_cur, tg_prev, tg_prev2, season, p, week)
         for _, g in upcoming[upcoming["week"] == week].iterrows():
             eid = str(int(g["espn"])) if pd.notna(g.get("espn")) else None
             e = espn.get(eid) if eid else None
@@ -55,6 +56,7 @@ def predictions(raw, season: int, now: datetime, weeks_ahead: int = 2) -> dict |
             game["wind"], game["temp"] = wind, temp
             game["roof"] = "dome" if indoor else "outdoors"
             margin, total = predict(game, at, ratings.lg, ratings.main_qb, p)
+            total += offset
             market_home_line = e["home_line"] if e and e["home_line"] is not None else (-g["spread_line"] if pd.notna(g.get("spread_line")) else None)
             market_total = e["total"] if e and e["total"] is not None else (g["total_line"] if pd.notna(g.get("total_line")) else None)
             out.append({
@@ -92,14 +94,15 @@ def replay(games, tg_cur, tg_prev, tg_prev2, season: int, p: Params) -> dict:
     have done at the closing lines: this season so far, which the model hadn't
     seen when it was calibrated, and last season, which it was calibrated on.
     """
-    live = Params(**{**p.__dict__, "spread_edge": SPREAD_EDGE, "total_edge": TOTAL_EDGE, "ml_edge": 1.0})
+    live = live_params(p)
 
     def record(df, label):
         s = summarize(df, label)
         return {k: s[k] for k in ("label", "games", "spread", "total", "all") if k in s}
 
-    out = {"last": record(run(games, tg_prev, tg_prev2, season - 1, live), f"{season - 1} season")}
-    cur = run(games, tg_cur, tg_prev, season, live)
+    last = run(games, tg_prev, tg_prev2, season - 1, live)
+    out = {"last": record(last, f"{season - 1} season")}
+    cur = run(games, tg_cur, tg_prev, season, live, anchor=last)
     if len(cur):
         out["this"] = record(cur, f"{season} so far")
     return out
