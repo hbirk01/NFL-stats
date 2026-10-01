@@ -62,6 +62,13 @@ CONTEXT = True
 HOME = {"rec": 1.015, "rec_yds": 1.021, "rush_yds": 1.008, "car": 1.008, "pass_yds": 1.021, "cmp": 1.016, "att": 1.004, "pass_td": 1.032}
 COLD = {"rec": 0.985, "rec_yds": 0.966, "rush_yds": 1.0, "car": 1.0, "pass_yds": 0.953, "cmp": 0.965, "att": 0.985, "pass_td": 0.991}
 COLD_F = 45
+# Snap trend: a receiver whose snaps over his last two games are above his
+# season average is gaining a role before his targets catch up (and the
+# reverse). Target share moves by SNAP_TREND x the change in snap share, from
+# week 4. Fitted on 2022-2024; on 2025-2026 receiving error fell (receptions
+# -0.4%), but for carries it didn't hold up (rushing yards +0.5%), so carries
+# get none.
+SNAP_TREND = {"tshare": 0.6, "cshare": 0.0}
 
 STATS = ("tgt", "rec", "rec_yds", "car", "rush_yds", "att", "cmp", "pass_yds", "pass_td", "ints")
 
@@ -209,6 +216,13 @@ class PropModel:
         c_sh = cur.groupby("id").apply(lambda g: _weighted(g, week, cols), include_groups=False) if len(cur) else pd.DataFrame(columns=cols + ["n"])
         p_sh = prev.groupby("id")[cols].mean() if len(prev) else pd.DataFrame(columns=cols)
         c_eff = cur.groupby("id")[eff].sum() if len(cur) else pd.DataFrame(columns=eff)
+        # Snap share in the last two games against the season so far.
+        trend = {}
+        if week > 3 and "snap_pct" in cur.columns:
+            sp = cur.dropna(subset=["snap_pct"])
+            last2 = sp[sp["week"] >= week - 2].groupby("id")["snap_pct"].mean()
+            season = sp.groupby("id")["snap_pct"].mean()
+            trend = (last2 - season.reindex(last2.index)).dropna().to_dict()
         p_eff = prev.groupby("id")[eff].sum() if len(prev) else pd.DataFrame(columns=eff)
         ids = set(c_sh.index) | set(p_sh.index)
         last = pd.concat([prev, cur]).sort_values(["season", "week"]).groupby("id").last()
@@ -234,7 +248,9 @@ class PropModel:
 
             rows.append({
                 "id": pid, "pos": pos, "team": info["posteam"],
-                "tshare": sh["tshare"], "cshare": sh["cshare"], "ashare": sh["ashare"], "games": n,
+                "tshare": sh["tshare"] * min(1.6, max(0.6, 1 + SNAP_TREND["tshare"] * trend.get(pid, 0.0))),
+                "cshare": sh["cshare"] * min(1.6, max(0.6, 1 + SNAP_TREND["cshare"] * trend.get(pid, 0.0))),
+                "ashare": sh["ashare"], "games": n, "snap_trend": trend.get(pid, 0.0),
                 "catch": rate(e["rec"], e["tgt"], lg["catch"].get(pos, 0.65), K["catch"]),
                 "ypt": rate(e["rec_yds"], e["tgt"], lg["ypt"].get(pos, 7.5), K["ypt"]),
                 "ypc": rate(e["rush_yds"], e["car"], lg["ypc"].get(pos, 4.2), K["ypc"]),
