@@ -8,7 +8,9 @@ game, counting only plays while the game is competitive (garbage time says
 little about a team). Early in a season they lean on last season's (pulled
 halfway to the league average for offseason changes); each game played shifts
 weight to this season, and a team with a new starting QB keeps only half of
-last season's offense (that offense was someone else's). Defense counts half: it's much less consistent week to
+last season's offense (that offense was someone else's). Each QB also has his
+own rating (EPA per dropback, career to date): the offense moves by the gap
+between this week's starter and the QBs who produced its rating. Defense counts half: it's much less consistent week to
 week than offense.
 
 Game. Expected EPA/play for each offense = league average + its offense rating
@@ -47,6 +49,16 @@ MARGIN_SD = 13.5  # spread of actual margins around the prediction, for win chan
 NEUTRAL_WP = (0.1, 0.9)  # plays count while neither team is above 90% to win
 DEF_WEIGHT = 0.5  # defense ratings count half
 CENTER_GAMES = 48  # last season's final games that center totals early in a season
+# QB ratings: each QB's own EPA per
+# dropback, career to date, recent seasons weighted more, pulled toward
+# replacement level for small samples. A game's offense moves by the gap between
+# its starter and the QBs who produced the team's rating, scaled by how much of
+# the offense is dropbacks.
+QB_WEIGHT = 1.5  # walk-forward 2021-2026: margin error 10.245 -> 10.177 points; bets unchanged (+9.5u -> +9.8u)
+DROPBACK_SHARE = 0.6
+QB_K = 250  # dropbacks of replacement-level play added to a QB's own
+QB_DECAY = 0.6  # each earlier season counts this much
+REPLACEMENT = -0.08  # EPA/dropback below league average for an unproven QB
 NEW_QB_PRIOR = 0.5  # how much of last season's offense carries over when the team has a new starting QB
 
 
@@ -101,11 +113,43 @@ def team_games(pbp: pd.DataFrame) -> pd.DataFrame:
     return off.merge(dfn, on=["game_id", "team"]).merge(qb, on=["game_id", "team"], how="left")
 
 
+def qb_games(pbp: pd.DataFrame) -> pd.DataFrame:
+    """Each QB's dropbacks and EPA per game (competitive plays only)."""
+    p = pbp[(pbp["qb_dropback"] == 1) & (pbp["two_point_attempt"].fillna(0) == 0) & pbp["epa"].notna()]
+    if "wp" in p.columns:
+        p = p[p["wp"].between(*NEUTRAL_WP)]
+    p = p.assign(qb=p["passer_player_id"].fillna(p["rusher_player_id"]))
+    return p.groupby(["season", "week", "game_id", "posteam", "qb"]).agg(db=("epa", "size"), epa=("epa", "sum")).reset_index()
+
+
+class QBRatings:
+    """Every QB's EPA per dropback before a given week, relative to league average."""
+
+    def __init__(self, qbg: pd.DataFrame):
+        self.qbg = qbg
+        self.lg = float(qbg["epa"].sum() / qbg["db"].sum())
+        self._cache: dict = {}
+
+    def table(self, season: int, week: int) -> dict:
+        key = (season, week)
+        if key not in self._cache:
+            h = self.qbg[(self.qbg["season"] < season) | ((self.qbg["season"] == season) & (self.qbg["week"] < week))]
+            w = QB_DECAY ** (season - h["season"])
+            agg = pd.DataFrame({"epa": h["epa"] * w, "db": h["db"] * w, "qb": h["qb"]}).groupby("qb")[["epa", "db"]].sum()
+            rating = (agg["epa"] + (self.lg + REPLACEMENT) * QB_K) / (agg["db"] + QB_K) - self.lg
+            self._cache[key] = rating.to_dict()
+        return self._cache[key]
+
+    def of(self, table: dict, qb) -> float:
+        return table.get(qb, REPLACEMENT) if isinstance(qb, str) else REPLACEMENT
+
+
 class Ratings:
     """Team ratings as of a given week: this season's games so far, blended with last season's."""
 
-    def __init__(self, cur: pd.DataFrame, prev: pd.DataFrame | None):
-        self.cur = cur
+    def __init__(self, cur: pd.DataFrame, prev: pd.DataFrame | None, qbr: QBRatings | None = None):
+        self.cur, self.prev, self.qbr = cur, prev, qbr
+        self.season = int(cur["season"].max()) if len(cur) else (int(prev["season"].max()) + 1 if prev is not None else 0)
         self.lg = float(pd.concat([cur["off_epa"], prev["off_epa"]]).mean()) if prev is not None else float(cur["off_epa"].mean())
         self.prior = {}
         self.cur_qb = {t: g["qb"].mode().iloc[0] for t, g in cur.groupby("team") if g["qb"].notna().any()} if len(cur) else {}
@@ -139,6 +183,16 @@ class Ratings:
                 po *= NEW_QB_PRIOR
             o = ((g["off_epa"].mean() - self.lg) * n + po * PRIOR_GAMES) / (n + PRIOR_GAMES) if n else po
             d = ((g["def_epa"].mean() - self.lg) * n + pd_ * PRIOR_GAMES) / (n + PRIOR_GAMES) if n else pd_
+            starter = (starters or {}).get(team)
+            if self.qbr is not None and QB_WEIGHT and isinstance(starter, str):
+                # The QBs behind the rating, weighted like the rating: this season's games
+                # in full, last season's (halved, like its offense) as PRIOR_GAMES games.
+                tab = self.qbr.table(self.season, week)
+                cur_r = sum(self.qbr.of(tab, q) for q in g["qb"])
+                pg = self.prev[self.prev["team"] == team] if self.prev is not None else g.iloc[0:0]
+                prev_r = (sum(self.qbr.of(tab, q) for q in pg["qb"]) / len(pg)) * 0.5 if len(pg) else 0.0
+                behind = (cur_r + prev_r * PRIOR_GAMES) / (n + PRIOR_GAMES)
+                o += QB_WEIGHT * DROPBACK_SHARE * (self.qbr.of(tab, starter) - behind)
             out[team] = (o, d * DEF_WEIGHT)
         return out
 
@@ -241,6 +295,28 @@ def season_games(games: pd.DataFrame, season: int) -> pd.DataFrame:
     return games[(games["season"] == season) & (games["game_type"] == "REG") & games["result"].notna()].sort_values(["week", "gameday"])
 
 
+def build_qb_ratings(pbps: list) -> QBRatings:
+    """QB ratings from the play-by-play seasons given (oldest to newest)."""
+    return QBRatings(pd.concat([qb_games(p) for p in pbps if p is not None]))
+
+
+def live_starters(wk: pd.DataFrame, main_qb: dict, injuries: dict) -> dict:
+    """
+    Who starts at QB this week: nflverse's listed starter, else the team's usual
+    one; "backup" (replacement level) when that QB is out or doubtful.
+    """
+    out = {}
+    listed = week_starters(wk)
+    for _, g in wk.iterrows():
+        for side in ("home", "away"):
+            team = g[f"{side}_team"]
+            qb = listed.get(team) or main_qb.get(team)
+            usual = main_qb.get(team)
+            hurt = {q for q in (qb, usual) if q and injuries.get(q, {}).get("status") in ("Out", "Doubtful")}
+            out[team] = "backup" if qb in hurt or (qb == usual and usual in hurt) else qb
+    return out
+
+
 def week_starters(wk: pd.DataFrame) -> dict:
     """Team -> listed starting QB for a week's games (nflverse's games file)."""
     out = {}
@@ -265,13 +341,13 @@ def total_offset(history: pd.DataFrame, week: int, anchor: pd.DataFrame | None =
     return float((h["total_line"] - h["total_raw"]).mean()) if len(h) else 0.0
 
 
-def run(games: pd.DataFrame, cur: pd.DataFrame, prev: pd.DataFrame | None, season: int, p: Params, anchor: pd.DataFrame | None = None) -> pd.DataFrame:
+def run(games: pd.DataFrame, cur: pd.DataFrame, prev: pd.DataFrame | None, season: int, p: Params, anchor: pd.DataFrame | None = None, qbr: QBRatings | None = None) -> pd.DataFrame:
     """
     Every prediction and pick for a season, week by week, using only games
     before each week. `anchor` is last season's run, which centers the totals
     in the first weeks.
     """
-    r = Ratings(cur, prev)
+    r = Ratings(cur, prev, qbr)
     preds = []
     for week, wk in season_games(games, season).groupby("week"):
         ratings = r.at(int(week), week_starters(wk))
@@ -292,10 +368,10 @@ def run(games: pd.DataFrame, cur: pd.DataFrame, prev: pd.DataFrame | None, seaso
     return pd.DataFrame(rows)
 
 
-def live_offset(games: pd.DataFrame, cur: pd.DataFrame, prev: pd.DataFrame, prev2: pd.DataFrame | None, season: int, p: Params, week: int) -> float:
+def live_offset(games: pd.DataFrame, cur: pd.DataFrame, prev: pd.DataFrame, prev2: pd.DataFrame | None, season: int, p: Params, week: int, qbr: QBRatings | None = None) -> float:
     """The totals offset for an upcoming week: this season's finished games plus the end of last season."""
-    anchor = run(games, prev, prev2, season - 1, p)
-    return total_offset(run(games, cur, prev, season, p, anchor), week, anchor)
+    anchor = run(games, prev, prev2, season - 1, p, qbr=qbr)
+    return total_offset(run(games, cur, prev, season, p, anchor, qbr=qbr), week, anchor)
 
 
 def fit(df: pd.DataFrame, p: Params) -> Params:
@@ -337,11 +413,11 @@ def live_params(p: Params) -> Params:
     return Params(**{**p.__dict__, "spread_edge": 4.0, "total_edge": 4.0, "ml_edge": 1.0})
 
 
-def walk_forward(games: pd.DataFrame, tg: dict, season: int) -> pd.DataFrame:
+def walk_forward(games: pd.DataFrame, tg: dict, season: int, qbr: QBRatings | None = None) -> pd.DataFrame:
     """One season as the live model would have played it: calibrated on the season before, live rules."""
-    p = live_params(fit(run(games, tg[season - 1], tg[season - 2], season - 1, Params()), Params()))
-    anchor = run(games, tg[season - 1], tg[season - 2], season - 1, p)
-    return run(games, tg[season], tg[season - 1], season, p, anchor)
+    p = live_params(fit(run(games, tg[season - 1], tg[season - 2], season - 1, Params(), qbr=qbr), Params()))
+    anchor = run(games, tg[season - 1], tg[season - 2], season - 1, p, qbr=qbr)
+    return run(games, tg[season], tg[season - 1], season, p, anchor, qbr=qbr)
 
 
 def main():
@@ -354,10 +430,12 @@ def main():
     games = load(raw, "games.csv", GAMES_CSV)
     first, _, last = args.seasons.partition("-")
     seasons = list(range(int(first), int(last or first) + 1))
-    tg = {s: team_games(pbp_for(raw, s)) for s in range(seasons[0] - 2, seasons[-1] + 1)}
+    pbp = {s: pbp_for(raw, s) for s in range(seasons[0] - 2, seasons[-1] + 1)}
+    tg = {s: team_games(p) for s, p in pbp.items()}
+    qbr = build_qb_ratings(list(pbp.values())) if QB_WEIGHT else None
     runs = []
     for season in seasons:
-        df = walk_forward(games, tg, season)
+        df = walk_forward(games, tg, season, qbr)
         runs.append(df)
         print(season, summarize(df, str(season)))
     print("all ", summarize(pd.concat(runs), args.seasons))

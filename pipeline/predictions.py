@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 import pandas as pd
 
 from build import injury_map, read
-from model import GAMES_CSV, Params, Ratings, fit, live_offset, live_params, load, pbp_for, predict, run, summarize, team_games, week_starters, win_prob
+from model import GAMES_CSV, Params, Ratings, build_qb_ratings, fit, live_offset, live_params, live_starters, load, pbp_for, predict, run, summarize, team_games, win_prob
 from picks import espn_week, kickoff_weather
 
 WEATHER_WITHIN = timedelta(hours=72)  # Open-Meteo's forecast reach, roughly
@@ -24,8 +24,9 @@ def predictions(raw, season: int, now: datetime, weeks_ahead: int = 2) -> dict |
     if games is None or pbp_cur is None or pbp_prev is None or pbp_prev2 is None:
         return None
     tg_cur, tg_prev, tg_prev2 = team_games(pbp_cur), team_games(pbp_prev), team_games(pbp_prev2)
-    p = fit(run(games, tg_prev, tg_prev2, season - 1, Params()), Params())
-    ratings = Ratings(tg_cur, tg_prev)
+    qbr = build_qb_ratings([pbp_prev2, pbp_prev, pbp_cur])
+    p = fit(run(games, tg_prev, tg_prev2, season - 1, Params(), qbr=qbr), Params())
+    ratings = Ratings(tg_cur, tg_prev, qbr)
     injuries = injury_map(read(raw, f"injuries/injuries_{season}.parquet"))
 
     upcoming = games[(games["season"] == season) & (games["game_type"] == "REG") & games["result"].isna()]
@@ -36,8 +37,8 @@ def predictions(raw, season: int, now: datetime, weeks_ahead: int = 2) -> dict |
             espn = espn_week(season, week)
         except Exception:
             espn = {}
-        at = ratings.at(week, week_starters(upcoming[upcoming["week"] == week]))
-        offset = live_offset(games, tg_cur, tg_prev, tg_prev2, season, p, week)
+        at = ratings.at(week, live_starters(upcoming[upcoming["week"] == week], ratings.main_qb, injuries))
+        offset = live_offset(games, tg_cur, tg_prev, tg_prev2, season, p, week, qbr)
         for _, g in upcoming[upcoming["week"] == week].iterrows():
             eid = str(int(g["espn"])) if pd.notna(g.get("espn")) else None
             e = espn.get(eid) if eid else None
@@ -83,12 +84,12 @@ def predictions(raw, season: int, now: datetime, weeks_ahead: int = 2) -> dict |
         "season": season,
         # The Model account's profile, so the app can find its picks (set in the workflow).
         "model_user": os.environ.get("MODEL_USER_ID") or None,
-        "replay": replay(games, tg_cur, tg_prev, tg_prev2, season, p),
+        "replay": replay(games, tg_cur, tg_prev, tg_prev2, season, p, qbr),
         "games": out,
     }
 
 
-def replay(games, tg_cur, tg_prev, tg_prev2, season: int, p: Params) -> dict:
+def replay(games, tg_cur, tg_prev, tg_prev2, season: int, p: Params, qbr=None) -> dict:
     """
     What the live rules (4+ point edges, spreads and totals, no moneylines) would
     have done at the closing lines: this season so far, which the model hadn't
@@ -100,9 +101,9 @@ def replay(games, tg_cur, tg_prev, tg_prev2, season: int, p: Params) -> dict:
         s = summarize(df, label)
         return {k: s[k] for k in ("label", "games", "spread", "total", "all") if k in s}
 
-    last = run(games, tg_prev, tg_prev2, season - 1, live)
+    last = run(games, tg_prev, tg_prev2, season - 1, live, qbr=qbr)
     out = {"last": record(last, f"{season - 1} season")}
-    cur = run(games, tg_cur, tg_prev, season, live, anchor=last)
+    cur = run(games, tg_cur, tg_prev, season, live, anchor=last, qbr=qbr)
     if len(cur):
         out["this"] = record(cur, f"{season} so far")
     return out
