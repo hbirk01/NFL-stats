@@ -54,6 +54,14 @@ PRIOR_EFF = 0.5  # last season's plays count half toward efficiency
 # Shrinkage: opportunities of league-average efficiency added to a player's own.
 K = {"catch": 40, "ypt": 60, "ypc": 80, "cmp": 150, "ypa": 200, "tdr": 400, "intr": 500}
 DEF_K = 6.0  # games of league-average defense added to a defense's own
+# Where and in what weather: measured on 2022-2024 (actual vs projected), tested
+# on 2025-2026. Players do a bit better at home and worse away (receiving and
+# passing about +/-2%, rushing about +/-1%); outdoor games at 45F or colder cut
+# receiving and passing (yards about -3 to -5%). Domes showed no difference.
+CONTEXT = True
+HOME = {"rec": 1.015, "rec_yds": 1.021, "rush_yds": 1.008, "car": 1.008, "pass_yds": 1.021, "cmp": 1.016, "att": 1.004, "pass_td": 1.032}
+COLD = {"rec": 0.985, "rec_yds": 0.966, "rush_yds": 1.0, "car": 1.0, "pass_yds": 0.953, "cmp": 0.965, "att": 0.985, "pass_td": 0.991}
+COLD_F = 45
 
 STATS = ("tgt", "rec", "rec_yds", "car", "rush_yds", "att", "cmp", "pass_yds", "pass_td", "ints")
 
@@ -286,7 +294,7 @@ class PropModel:
                     rush_yds = c * r["ypc"] * f.get("ypc", 1.0)
                     a = r["ashare"] * att if r["pos"] == "QB" else 0.0
                     qb = d.get("QB", {})
-                    out.append({
+                    row = {
                         "id": pid, "week": week, "team": team, "opp": opp, "pos": r["pos"],
                         # The inputs, for showing why: this week's shares and the team's expected volume.
                         "tgt_share": r["tshare"] * ts / self.league["tgt_rate"] if tsum else 0.0, "car_share": r["cshare"] * cs if csum else 0.0,
@@ -296,7 +304,15 @@ class PropModel:
                         "pass_yds": a * r["ypa"] * qb.get("ypa", 1.0) * wind_f,
                         "pass_td": a * r["tdr"] * (implied / fit["pts0"]),
                         "ints": a * r["intr"],
-                    })
+                    }
+                    if CONTEXT:
+                        home = team == g["home_team"]
+                        indoor = str(g.get("roof") or "") in ("dome", "closed")
+                        temp = g.get("temp")
+                        cold = not indoor and pd.notna(temp) and temp <= COLD_F
+                        for st, h in HOME.items():
+                            row[st] *= (h if home else 2 - h) * (COLD[st] if cold else 1.0)
+                    out.append(row)
         return pd.DataFrame(out)
 
 
@@ -453,7 +469,7 @@ def upcoming(raw: Path, season: int, games: pd.DataFrame, spread: dict | None = 
     if not len(left):
         return None
     week = int(left["week"].min())
-    wk_games = left[left["week"] == week]
+    wk_games = with_weather(left[left["week"] == week].copy(), season, week)
 
     roster = read(raw, f"rosters/roster_{season}.parquet")
     roster = roster[roster["week"] == roster["week"].max()]
@@ -503,6 +519,35 @@ def upcoming(raw: Path, season: int, games: pd.DataFrame, spread: dict | None = 
         td_rows = []
     return {"season": season, "week": week, "report_week": report, "tds": td_rows, "under_at": UNDER_AT, "under_floor": UNDER_FLOOR, "props": rows, "_lines": lines,
             "_proj": {e: {st: float(proj.loc[g, st]) for st in PROP_STATS} | {"name": names.get(g), "team": proj.loc[g, "team"], "inputs": {k: float(proj.loc[g, k]) for k in ("tgt", "car", "att", "tgt_share", "car_share", "team_att", "team_car")}} for e, g in by_espn.items()}}
+
+
+def with_weather(wk_games: pd.DataFrame, season: int, week: int) -> pd.DataFrame:
+    """
+    Kickoff wind and temperature for outdoor games within the forecast's reach
+    (nflverse only fills them in after the games), so the wind and cold
+    adjustments apply to upcoming games too.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from picks import espn_week, kickoff_weather
+
+    try:
+        espn = espn_week(season, week)
+    except Exception:
+        return wk_games
+    now = datetime.now(timezone.utc)
+    for i, g in wk_games.iterrows():
+        e = espn.get(str(int(g["espn"]))) if pd.notna(g.get("espn")) else None
+        if not e:
+            continue
+        if e["indoor"]:
+            wk_games.loc[i, "roof"] = "dome"
+            continue
+        if pd.isna(g.get("wind")) and e["start"] - now <= timedelta(hours=72):
+            wind, temp = kickoff_weather(e["city"], e["start"])
+            if wind is not None:
+                wk_games.loc[i, "wind"], wk_games.loc[i, "temp"] = wind, temp
+    return wk_games
 
 
 ARCHIVE = "https://raw.githubusercontent.com/hbirk01/NFL-stats/data/props-lines"
