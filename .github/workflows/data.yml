@@ -20,6 +20,8 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # For MODEL_USER_ID, which model.json carries so the app can find the Model's picks.
+    environment: Production
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -29,6 +31,8 @@ jobs:
           cache-dependency-path: pipeline/requirements.txt
       - run: pip install -r pipeline/requirements.txt
       - run: python pipeline/build.py --out dist
+        env:
+          MODEL_USER_ID: ${{ secrets.MODEL_USER_ID }}
       - name: Publish to the data branch
         run: |
           cd dist
