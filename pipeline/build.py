@@ -780,6 +780,18 @@ def main():
             write(out / "model.json", model)
     except Exception as e:  # noqa: BLE001
         print(f"  model predictions skipped: {e}")
+    # Player props: the model against DraftKings' lines, and the lines archive. Never fails the build.
+    try:
+        import props
+
+        up = props.upcoming(raw, season, schedule)
+        if up:
+            up.pop("_proj", None)
+            n = props.archive(out, up["season"], up["week"], up.pop("_lines"), schedule)
+            write(out / "props.json", {"generated": now.isoformat(timespec="seconds"), **up})
+            print(f"  props: {len(up['props'])} lines for week {up['week']} ({n} weeks archived)")
+    except Exception as e:  # noqa: BLE001
+        print(f"  props skipped: {e}")
     if cbs:
         write(out / "cornerbacks.json", cbs)
     write(out / "meta.json", {
