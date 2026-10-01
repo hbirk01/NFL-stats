@@ -33,6 +33,7 @@ from pathlib import Path
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).parent))
+import alerts  # noqa: E402
 from build import defense_outlook, defense_vs_position, game_lines, injury_map, read, real_plays  # noqa: E402
 from model import GAMES_CSV, Params, Ratings, fit, live_offset, load, pbp_for, predict, run, team_games, week_starters  # noqa: E402
 
@@ -131,9 +132,12 @@ class Supabase:
     def select(self, table: str, query: str) -> list:
         return get_json(f"{self.url}/rest/v1/{table}?{query}", self.headers)
 
-    def insert(self, table: str, rows: list[dict]) -> None:
+    def insert(self, table: str, rows: list[dict], on_conflict: str | None = None) -> None:
+        """Inserts rows; with on_conflict, rows matching an existing one on those columns are skipped."""
+        query = f"?on_conflict={on_conflict}" if on_conflict else ""
+        prefer = "return=minimal" + (",resolution=ignore-duplicates" if on_conflict else "")
         req = urllib.request.Request(
-            f"{self.url}/rest/v1/{table}", data=json.dumps(rows).encode(), method="POST", headers={**self.headers, "Prefer": "return=minimal"}
+            f"{self.url}/rest/v1/{table}{query}", data=json.dumps(rows).encode(), method="POST", headers={**self.headers, "Prefer": prefer}
         )
         with urllib.request.urlopen(req, timeout=20):
             pass
@@ -346,6 +350,14 @@ def main():
         if picks:
             db.insert("bets", [{**x, "user_id": model_user} for x in picks])
     print(f"Week {week}: {len(picks)} new pick(s)")
+    if db:
+        # Injury notifications (pushed to phones). Never let them stop the picks.
+        try:
+            roster_now = read(raw, f"rosters/roster_{season}.parquet").sort_values("week").drop_duplicates("gsis_id", keep="last")
+            n = alerts.run(db, games, roster_now, injuries, ratings.main_qb, season, week, now, get_json)
+            print(f"Injury alerts: {n} checked")
+        except Exception as e:
+            print(f"Injury alerts skipped: {e}")
     for x in picks:
         print(f"  {x['event_description']:<12} {x['selection']:<40} {x['odds']:+g}  {'*' * x['confidence']}  {x['notes']}")
 
