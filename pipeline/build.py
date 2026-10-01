@@ -788,6 +788,10 @@ def main():
         if up:
             up.pop("_proj", None)
             n = props.archive(out, up["season"], up["week"], up.pop("_lines"), schedule)
+            try:
+                props.with_confidence(up, raw, up["season"], schedule, out / "props-lines")
+            except Exception as e:  # noqa: BLE001
+                print(f"  props confidence skipped: {e}")
             write(out / "props.json", {"generated": now.isoformat(timespec="seconds"), **up})
             print(f"  props: {len(up['props'])} lines for week {up['week']} ({n} weeks archived)")
     except Exception as e:  # noqa: BLE001
