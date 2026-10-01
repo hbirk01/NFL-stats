@@ -99,9 +99,25 @@ def season_data(raw: Path, season: int) -> dict | None:
         for c in STATS + ("pass_td", "rec_td", "rush_td"):
             if c in lines.columns:
                 lines[c] = lines[c].fillna(0)
+    # Touchdowns scored and red-zone work (inside the 10), per player and team game, for the TD model.
+    lines["td"] = lines.get("rush_td", 0) + lines.get("rec_td", 0)
+    rz = p[p["yardline_100"] <= 10]
+    rz_car = rz[rz["rush_attempt"] == 1].groupby(["rusher_player_id", "game_id"]).size().rename("rz_car")
+    rz_tgt = rz[(rz["pass_attempt"] == 1) & rz["receiver_player_id"].notna()].groupby(["receiver_player_id", "game_id"]).size().rename("rz_tgt")
+    lines = lines.merge(rz_car.rename_axis(["id", "game_id"]).reset_index(), on=["id", "game_id"], how="left")
+    lines = lines.merge(rz_tgt.rename_axis(["id", "game_id"]).reset_index(), on=["id", "game_id"], how="left")
+    lines[["rz_car", "rz_tgt", "td"]] = lines[["rz_car", "rz_tgt", "td"]].fillna(0)
+    team_rz = rz.groupby(["game_id", "posteam"]).agg(
+        team_rz_car=("rush_attempt", "sum"),
+        team_rz_tgt=("pass_attempt", lambda s: int((s == 1).sum())),
+    ).reset_index().rename(columns={"posteam": "team"})
+    team_td = lines.groupby(["game_id", "posteam"])["td"].sum().rename("team_td").reset_index().rename(columns={"posteam": "team"})
+    team = team.merge(team_rz, on=["game_id", "team"], how="left").merge(team_td, on=["game_id", "team"], how="left").fillna({"team_rz_car": 0, "team_rz_tgt": 0, "team_td": 0})
     lines = lines[lines["pos"].isin(POSITIONS) & lines["week"].notna()].copy()
     lines["week"] = lines["week"].astype(int)
-    lines = lines.merge(team.rename(columns={"team": "posteam"})[["game_id", "posteam", "team_att", "team_car"]], on=["game_id", "posteam"], how="left")
+    lines = lines.merge(
+        team.rename(columns={"team": "posteam"})[["game_id", "posteam", "team_att", "team_car", "team_rz_car", "team_rz_tgt", "team_td"]], on=["game_id", "posteam"], how="left"
+    )
     lines["season"] = season
     return {"lines": lines, "team": team, "pos": pos}
 
@@ -476,7 +492,16 @@ def upcoming(raw: Path, season: int, games: pd.DataFrame, spread: dict | None = 
     rows.sort(key=lambda x: (x["p_over"] if x["p_over"] is not None else 0.5))
     # Every projected player's numbers by ESPN id, for lines that aren't DraftKings' (friends' bets).
     by_espn = {e: g for e, g in espn_to.items() if g in proj.index}
-    return {"season": season, "week": week, "report_week": report, "under_at": UNDER_AT, "under_floor": UNDER_FLOOR, "props": rows, "_lines": lines,
+    # Anytime touchdown chances for everyone expected to play (pipeline/tds.py).
+    try:
+        import tds
+
+        gsis_espn = {g: e for e, g in espn_to.items()}
+        td_rows = tds.upcoming_tds(cur["lines"], prev["lines"], week, wk_games, team_of, names, gsis_espn)
+    except Exception as e:  # noqa: BLE001
+        print(f"  anytime TDs skipped: {e}")
+        td_rows = []
+    return {"season": season, "week": week, "report_week": report, "tds": td_rows, "under_at": UNDER_AT, "under_floor": UNDER_FLOOR, "props": rows, "_lines": lines,
             "_proj": {e: {st: float(proj.loc[g, st]) for st in PROP_STATS} | {"name": names.get(g), "team": proj.loc[g, "team"], "inputs": {k: float(proj.loc[g, k]) for k in ("tgt", "car", "att", "tgt_share", "car_share", "team_att", "team_car")}} for e, g in by_espn.items()}}
 
 
