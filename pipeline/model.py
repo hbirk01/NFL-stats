@@ -33,6 +33,7 @@ chance by at least the threshold.
 from __future__ import annotations
 
 import argparse
+import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
@@ -408,6 +409,26 @@ def summarize(df: pd.DataFrame, label: str) -> dict:
     return out
 
 
+# The Model only bets what has actually won: a market's measured record at the
+# live rules, pulled toward break-even (52.4% at -110) by PRIOR_N bets, must
+# reach MIN_CONFIDENCE. Measured over whole markets, not edge sizes: edge
+# buckets zig-zag (44%, 61%, 44%), which is noise, not a pattern.
+MIN_CONFIDENCE = 0.55
+BREAK_EVEN = 0.524
+PRIOR_N = 40
+GAME_CONFIDENCE_FILE = Path(__file__).with_name("game_confidence.json")
+
+
+def game_confidence(df: pd.DataFrame) -> dict:
+    """Per market, the live rules' record in walk-forward runs, and its (shrunk) win rate."""
+    out = {}
+    for market in ("spread", "total"):
+        b = df[df["market"] == market]
+        won, lost = int((b["profit"] > 0).sum()), int((b["profit"] < 0).sum())
+        out[market] = {"won": won, "lost": lost, "rate": round((won + BREAK_EVEN * PRIOR_N) / (won + lost + PRIOR_N), 3)}
+    return out
+
+
 def live_params(p: Params) -> Params:
     """The live rules: spreads and totals 4+ points off the line, no moneylines."""
     return Params(**{**p.__dict__, "spread_edge": 4.0, "total_edge": 4.0, "ml_edge": 1.0})
@@ -424,6 +445,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--seasons", default="2021-2025", help="test seasons, e.g. 2021-2025 (each needs the two before it)")
     ap.add_argument("--raw", default="raw")
+    ap.add_argument("--confidence", action="store_true", help=f"also rewrite {GAME_CONFIDENCE_FILE.name} from these seasons")
     args = ap.parse_args()
     raw = Path(args.raw)
     raw.mkdir(parents=True, exist_ok=True)
@@ -439,6 +461,10 @@ def main():
         runs.append(df)
         print(season, summarize(df, str(season)))
     print("all ", summarize(pd.concat(runs), args.seasons))
+    if args.confidence:
+        conf = {"seasons": args.seasons, **game_confidence(pd.concat(runs))}
+        GAME_CONFIDENCE_FILE.write_text(json.dumps(conf))
+        print("confidence", conf)
 
 
 if __name__ == "__main__":

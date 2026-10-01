@@ -7,11 +7,14 @@ Each run (see .github/workflows/model.yml):
   2. Ratings and predictions from pipeline/model.py, calibrated on last season.
   3. Weather at kickoff (Open-Meteo, free) for outdoor games; the starting QB
      counted out if the latest injury report has him out or doubtful.
-  4. Bets at DraftKings' current line (via ESPN): totals at a 4+ point edge,
-     spreads at 4+ points. No moneylines (unreliable in backtests).
+  4. Game lines: spreads and totals 4+ points off DraftKings' current line
+     (via ESPN), bet only if that market's measured record clears
+     MIN_CONFIDENCE (55%; game_confidence.json, from walk-forward runs).
+     Otherwise they're printed as leans. No moneylines.
   5. Props: DraftKings' player lines and the props friends logged, against
      the prop model (pipeline/props.py). Unders only, where it gives the over
-     a 25-42% chance; one per player, at most 8 a week.
+     a 25-42% chance, in a range whose unders have won 55%+ this season; most
+     confident first, one per player, at most 8 a week.
 Flat 1-unit ($10) stakes; the reasoning goes in each bet's notes.
 
   python pipeline/picks.py --dry-run          # print, don't post
@@ -36,7 +39,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 import alerts  # noqa: E402
 import props  # noqa: E402
 from build import injury_map, read  # noqa: E402
-from model import GAMES_CSV, Params, Ratings, build_qb_ratings, fit, live_offset, live_starters, load, pbp_for, predict, run, team_games  # noqa: E402
+from model import GAME_CONFIDENCE_FILE, GAMES_CSV, MIN_CONFIDENCE, Params, Ratings, build_qb_ratings, fit, live_offset, live_starters, load, pbp_for, predict, run, team_games  # noqa: E402
 
 STAKE = 10.0
 WINDOW = timedelta(hours=36)
@@ -250,6 +253,8 @@ def prop_picks(up: dict, espn: dict, open_bets: list, posted: int, now: datetime
         if cands_key not in seen:
             rows.append(c)
             seen.add(cands_key)
+    # Only what has won enough, most confident first.
+    rows = [c for c in rows if c["conf"] >= MIN_CONFIDENCE]
     rows.sort(key=lambda c: (-c["conf"], c["p_over"]))
     out = []
     for c in rows[: max(0, MAX_PROPS - posted)]:
@@ -302,6 +307,15 @@ def main():
     wk_games = upcoming[upcoming["week"] == week]
     offset = live_offset(games, tg_cur, tg_prev, tg_prev2, season, p, week, qbr)
     picks = game_picks(week, wk_games, espn, ratings, p, now, injuries, offset)
+    # Game lines are bet only in a market whose measured record clears the bar.
+    conf = json.loads(GAME_CONFIDENCE_FILE.read_text()) if GAME_CONFIDENCE_FILE.exists() else {}
+    held = [x for x in picks if conf.get(x["bet_type"], {}).get("rate", 0) < MIN_CONFIDENCE]
+    if held:
+        rates = ", ".join(f"{m}s {conf[m]['rate']:.1%} ({conf[m]['won']}-{conf[m]['lost']})" for m in ("spread", "total") if m in conf)
+        print(f"Game leans not bet ({len(held)}): below {MIN_CONFIDENCE:.0%} confidence ({rates})")
+        for x in held:
+            print(f"  lean  {x['event_description']:<12} {x['selection']:<30} {x['notes']}")
+    picks = [x for x in picks if x not in held]
 
     db = None
     model_user = os.environ.get("MODEL_USER_ID")
