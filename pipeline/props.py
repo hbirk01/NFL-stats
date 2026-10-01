@@ -519,6 +519,49 @@ def archive(out: Path, season: int, week: int, lines: list[dict], games: pd.Data
     return len(names)
 
 
+# Confidence: how often the model's unders have actually won, by its chance of the
+# over (testing found no steady "further from the line = better" pattern, so it's
+# measured, not assumed). Recomputed from the archived lines every data run;
+# small samples lean toward break-even at -110.
+BUCKETS = [(0.0, 0.25), (0.25, 0.30), (0.30, 0.34), (0.34, 0.38), (0.38, 0.42), (0.42, 0.46), (0.46, 0.50)]
+BREAK_EVEN = 0.524
+PRIOR_N = 40
+
+
+def confidence_table(scored: pd.DataFrame) -> list[dict]:
+    """Per range of the over chance: unders won and lost so far, and the (shrunk) win rate."""
+    s = scored.dropna(subset=["p_over"])
+    s = s[s["act"] != s["line"]]
+    out = []
+    for lo, hi in BUCKETS:
+        g = s[(s["p_over"] > lo) & (s["p_over"] <= hi)]
+        won = int((g["act"] < g["line"]).sum())
+        lost = len(g) - won
+        out.append({"lo": lo, "hi": hi, "won": won, "lost": lost, "rate": round((won + BREAK_EVEN * PRIOR_N) / (won + lost + PRIOR_N), 3)})
+    return out
+
+
+def confidence_of(table: list[dict] | None, p: float | None) -> dict | None:
+    """The record for an under at this chance of going over (None for overs)."""
+    if p is None or not table:
+        return None
+    for b in table:
+        if b["lo"] < p <= b["hi"] or (b["lo"] == 0 and p == 0):
+            return {"rate": b["rate"], "won": b["won"], "lost": b["lost"]}
+    return None
+
+
+def with_confidence(up: dict, raw: Path, season: int, games: pd.DataFrame, lines_dir: Path) -> None:
+    """Scores this season's archived lines and adds each prop's confidence (and the table) to `up`."""
+    walked = walk(raw, [season], games)
+    roster = read(raw, f"rosters/roster_{season}.parquet")
+    spread = json.loads(SPREAD_FILE.read_text())
+    table = confidence_table(score_lines(walked, lines_dir, roster, spread))
+    up["confidence"] = table
+    for x in up["props"]:
+        x["confidence"] = confidence_of(table, x["p_over"])
+
+
 def score_lines(walked: pd.DataFrame, lines_dir: Path, roster: pd.DataFrame, spread: dict) -> pd.DataFrame:
     """Archived DraftKings lines joined with the walked projections and results."""
     espn = {str(int(e)): g for e, g in zip(roster["espn_id"], roster["gsis_id"]) if pd.notna(e)}

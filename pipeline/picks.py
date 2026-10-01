@@ -210,13 +210,18 @@ def game_picks(week: int, games: pd.DataFrame, espn: dict, ratings: Ratings, p: 
     return rows
 
 
-def prop_picks(up: dict, espn: dict, open_bets: list, posted: int, now: datetime) -> list[dict]:
+PROPS_JSON = "https://raw.githubusercontent.com/hbirk01/NFL-stats/data/props.json"
+
+
+def prop_picks(up: dict, espn: dict, open_bets: list, posted: int, now: datetime, table: list | None = None) -> list[dict]:
     """
     Player prop unders from the prop model (pipeline/props.py): DraftKings'
     lines, plus lines friends logged. Only where the model gives the over
     between UNDER_FLOOR and UNDER_AT (its overs didn't win in testing, and a
     far-off line usually means news it doesn't have), games within the window,
     one per player, at most MAX_PROPS a week counting ones already posted.
+    The most confident first: the range whose unders have won most so far
+    (props.confidence_table, published with props.json).
     """
     stat_id = {v: k for k, v in PROP_COLS.items()}
     proj = up.get("_proj", {})
@@ -240,11 +245,12 @@ def prop_picks(up: dict, espn: dict, open_bets: list, posted: int, now: datetime
         if po is None or not (props.UNDER_FLOOR < po <= props.UNDER_AT):
             continue
         cands_key = c["espn"]
-        c.update(p_over=po, median=props.median(spread, c["stat"], p[c["stat"]]), name=p["name"], inputs=p["inputs"], game=e)
+        conf = props.confidence_of(table, po)
+        c.update(p_over=po, median=props.median(spread, c["stat"], p[c["stat"]]), name=p["name"], inputs=p["inputs"], game=e, conf=conf["rate"] if conf else props.BREAK_EVEN)
         if cands_key not in seen:
             rows.append(c)
             seen.add(cands_key)
-    rows.sort(key=lambda c: c["p_over"])
+    rows.sort(key=lambda c: (-c["conf"], c["p_over"]))
     out = []
     for c in rows[: max(0, MAX_PROPS - posted)]:
         label = PROP_LABELS[stat_id[c["stat"]]]
@@ -258,8 +264,8 @@ def prop_picks(up: dict, espn: dict, open_bets: list, posted: int, now: datetime
             "sportsbook": "draftkings", "sport": "NFL", "event_description": f"{c['game']['away']['abbr']} @ {c['game']['home']['abbr']}", "stake": STAKE, "is_public": True,
             "bet_type": "prop", "selection": f"{c['name']} {label} Under {c['line']:g}", "subject": c["name"],
             "player_id": c["espn"], "prop_stat": stat_id[c["stat"]], "line": c["line"], "side": "under", "odds": -115, "potential_payout": payout(STAKE, -115),
-            "event_id": c["event"], "sport_path": "football/nfl", "event_start": c["game"]["start"].isoformat(), "confidence": confidence(props.UNDER_AT - c["p_over"], 0.08),
-            "notes": f"Model median {c['median']:.1f} vs {c['line']:g} ({c['p_over']:.0%} to go over), from {why}. Line from {c['source']}; odds assumed -115.",
+            "event_id": c["event"], "sport_path": "football/nfl", "event_start": c["game"]["start"].isoformat(), "confidence": max(1, min(5, round((c["conf"] - props.BREAK_EVEN) / 0.015) + 2)),
+            "notes": f"Model median {c['median']:.1f} vs {c['line']:g} ({c['p_over']:.0%} to go over), from {why}. Unders like this have won {c['conf']:.0%} so far. Line from {c['source']}; odds assumed -115.",
         })
     return out
 
@@ -323,7 +329,11 @@ def main():
     try:
         up = props.upcoming(raw, season, games)
         if up and up["week"] == week:
-            picks += prop_picks(up, espn, open_bets, posted, now)
+            try:
+                table = get_json(PROPS_JSON).get("confidence")
+            except Exception:
+                table = None
+            picks += prop_picks(up, espn, open_bets, posted, now, table)
     except Exception as e:  # the game picks still go out
         print(f"Prop picks skipped: {e}")
 
