@@ -34,7 +34,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).parent))
 from build import defense_outlook, defense_vs_position, game_lines, injury_map, read, real_plays  # noqa: E402
-from model import GAMES_CSV, Params, Ratings, fit, load, pbp_for, predict, run, team_games  # noqa: E402
+from model import GAMES_CSV, Params, Ratings, fit, live_offset, load, pbp_for, predict, run, team_games, week_starters  # noqa: E402
 
 STAKE = 10.0
 WINDOW = timedelta(hours=36)
@@ -150,9 +150,10 @@ def confidence(edge: float, step: float) -> int:
     return max(1, min(5, 2 + int(edge // step)))
 
 
-def game_picks(week: int, games: pd.DataFrame, espn: dict, ratings: Ratings, p: Params, now: datetime, injuries: dict) -> list[dict]:
+def game_picks(week: int, games: pd.DataFrame, espn: dict, ratings: Ratings, p: Params, now: datetime, injuries: dict, offset: float = 0.0) -> list[dict]:
+    """Spread and total picks; `offset` centers the model's totals on the market's (see model.total_offset)."""
     rows = []
-    at = ratings.at(week)
+    at = ratings.at(week, week_starters(games))
     for _, g in games.iterrows():
         e = espn.get(str(int(g["espn"]))) if pd.notna(g.get("espn")) else None
         if not e or e["state"] != "pre" or not (now < e["start"] <= now + WINDOW):
@@ -171,6 +172,7 @@ def game_picks(week: int, games: pd.DataFrame, espn: dict, ratings: Ratings, p: 
         game["wind"], game["temp"] = wind, temp
         game["roof"] = "dome" if e["indoor"] else "outdoors"
         margin, total = predict(game, at, ratings.lg, ratings.main_qb, p)
+        total += offset
         matchup = f"{e['away']['abbr']} @ {e['home']['abbr']}"
         weather = f" Kickoff: {round(wind)} mph wind, {round(temp)}°F." if wind is not None and temp is not None else " Indoors." if e["indoor"] else ""
         qb_note = "".join(f" {g[f'{s}_team']} without its starting QB." for s in ("home", "away") if game[f"{s}_qb_id"] == "backup")
@@ -303,7 +305,8 @@ def main():
         return
     espn = espn_week(season, week)
     wk_games = upcoming[upcoming["week"] == week]
-    picks = game_picks(week, wk_games, espn, ratings, p, now, injuries)
+    offset = live_offset(games, tg_cur, tg_prev, tg_prev2, season, p, week)
+    picks = game_picks(week, wk_games, espn, ratings, p, now, injuries, offset)
 
     db = None
     model_user = os.environ.get("MODEL_USER_ID")
