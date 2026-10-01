@@ -9,9 +9,9 @@ Each run (see .github/workflows/model.yml):
      counted out if the latest injury report has him out or doubtful.
   4. Bets at DraftKings' current line (via ESPN): totals at a 4+ point edge,
      spreads at 4+ points. No moneylines (unreliable in backtests).
-  5. Props: the open NFL props your friends logged, handicapped from each
-     player's games this season and last against the opponent's defense;
-     bets the side the projection favors by 15%+.
+  5. Props: DraftKings' player lines and the props friends logged, against
+     the prop model (pipeline/props.py). Unders only, where it gives the over
+     a 25-42% chance; one per player, at most 8 a week.
 Flat 1-unit ($10) stakes; the reasoning goes in each bet's notes.
 
   python pipeline/picks.py --dry-run          # print, don't post
@@ -34,15 +34,15 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).parent))
 import alerts  # noqa: E402
-from build import defense_outlook, defense_vs_position, game_lines, injury_map, read, real_plays  # noqa: E402
+import props  # noqa: E402
+from build import injury_map, read  # noqa: E402
 from model import GAMES_CSV, Params, Ratings, fit, live_offset, load, pbp_for, predict, run, team_games, week_starters  # noqa: E402
 
 STAKE = 10.0
 WINDOW = timedelta(hours=36)
 SPREAD_EDGE = 4.0
 TOTAL_EDGE = 4.0
-PROP_EDGE = 0.15
-MAX_PROPS = 8
+MAX_PROPS = 8  # prop picks a week
 ESPN = "https://site.api.espn.com/apis/site/v2/sports/football/nfl"
 
 # Prop stat id -> per-game column from build.game_lines.
@@ -210,74 +210,58 @@ def game_picks(week: int, games: pd.DataFrame, espn: dict, ratings: Ratings, p: 
     return rows
 
 
-def prop_picks(open_bets: list, roster: pd.DataFrame, lines_cur: pd.DataFrame, lines_prev: pd.DataFrame | None, defense: dict, now: datetime) -> list[dict]:
-    """The model's side of the props friends logged, where its projection disagrees with the line by 15%+."""
-    espn_to = {str(int(r["espn_id"])): r for _, r in roster.iterrows() if pd.notna(r.get("espn_id"))}
-    avg_allowed = {pos: sum(r["ppg_ros"] or 0 for r in rows) / max(1, len(rows)) for pos, rows in defense.items()}
-    seen, rows = set(), []
-    props = []
+def prop_picks(up: dict, espn: dict, open_bets: list, posted: int, now: datetime) -> list[dict]:
+    """
+    Player prop unders from the prop model (pipeline/props.py): DraftKings'
+    lines, plus lines friends logged. Only where the model gives the over
+    between UNDER_FLOOR and UNDER_AT (its overs didn't win in testing, and a
+    far-off line usually means news it doesn't have), games within the window,
+    one per player, at most MAX_PROPS a week counting ones already posted.
+    """
+    stat_id = {v: k for k, v in PROP_COLS.items()}
+    proj = up.get("_proj", {})
+    cands = []
+    for x in up["props"]:
+        cands.append({"espn": x["espn"], "stat": x["stat"], "line": x["line"], "event": x["event"], "source": "DraftKings"})
     for b in open_bets:
-        if b["bet_type"] == "prop":
-            props.append(b)
-        for leg in b.get("legs") or []:
-            if leg.get("kind") == "prop" and not leg.get("result"):
-                props.append({**leg, "subject": leg.get("player"), "event_id": leg.get("event_id") or b.get("event_id"), "event_start": leg.get("event_start") or b.get("event_start"), "odds": leg.get("odds")})
-    for b in props:
-        pid, stat, line = b.get("player_id"), b.get("prop_stat"), b.get("line")
-        if not (pid and stat and line is not None and b.get("event_id") and b.get("event_start")) or stat not in PROP_LABELS:
+        legs = [b] if b.get("bet_type") == "prop" else [leg for leg in (b.get("legs") or []) if leg.get("kind") == "prop"]
+        for leg in legs:
+            col = PROP_COLS.get(leg.get("prop_stat") or "")
+            if col and leg.get("player_id") and leg.get("line") is not None and (leg.get("event_id") or b.get("event_id")):
+                cands.append({"espn": str(leg["player_id"]), "stat": col, "line": float(leg["line"]), "event": str(leg.get("event_id") or b.get("event_id")), "source": "a friend's bet"})
+    spread = json.loads(props.SPREAD_FILE.read_text())
+    rows, seen = [], set()
+    for c in cands:
+        p = proj.get(c["espn"])
+        e = espn.get(c["event"])
+        if not p or not e or e["state"] != "pre" or not (now < e["start"] <= now + WINDOW) or c["stat"] not in stat_id:
             continue
-        start = datetime.fromisoformat(str(b["event_start"]).replace("Z", "+00:00"))
-        if not (now < start <= now + WINDOW):
+        po = props.p_over(spread, c["stat"], p[c["stat"]], c["line"])
+        if po is None or not (props.UNDER_FLOOR < po <= props.UNDER_AT):
             continue
-        key = (pid, stat, float(line))
-        if key in seen or pid not in espn_to:
-            continue
-        seen.add(key)
-        r = espn_to[pid]
-        gsis, pos, team = r["gsis_id"], r["position"], r["team"]
-
-        def values(lines):
-            if lines is None:
-                return []
-            mine = lines[lines["id"] == gsis]
-            if stat == "nfl_rush_rec_yds":
-                return list(mine["rush_yds"] + mine["rec_yds"])
-            return list(mine[PROP_COLS[stat]])
-
-        cur, prev = values(lines_cur), values(lines_prev)
-        if len(cur) + len(prev) < 3:
-            continue
-        n = len(cur)
-        mean_cur = sum(cur) / n if n else 0
-        mean_prev = sum(prev) / len(prev) if prev else mean_cur
-        proj = (mean_cur * n + mean_prev * 3) / (n + 3)
-        # The opponent: how much it allows to the position vs average (capped at +/-10%).
-        opp = None
-        g = lines_cur[lines_cur["id"] == gsis].sort_values("week").tail(1)
-        if len(g):
-            opp_row = next((x for x in defense.get(pos, []) if x["team"] == g.iloc[0]["opp"]), None)
-            opp = opp_row
-        factor = 1.0
-        if opp and avg_allowed.get(pos):
-            factor = max(0.9, min(1.1, (opp["ppg_ros"] or avg_allowed[pos]) / avg_allowed[pos]))
-        proj *= factor
-        line = float(line)
-        if line < 1.5:
-            continue
-        rel = (proj - line) / line
-        if abs(rel) < PROP_EDGE:
-            continue
-        side = "over" if rel > 0 else "under"
-        name = b.get("subject") or r["full_name"]
-        rows.append({
-            "sportsbook": "draftkings", "sport": "NFL", "event_description": b.get("event_description") or f"{team} game", "stake": STAKE, "is_public": True,
-            "bet_type": "prop", "selection": f"{name} {PROP_LABELS[stat]} {'Over' if side == 'over' else 'Under'} {line:g}", "subject": name,
-            "player_id": pid, "prop_stat": stat, "line": line, "side": side, "odds": -115, "potential_payout": payout(STAKE, -115),
-            "event_id": b["event_id"], "sport_path": "football/nfl", "event_start": b["event_start"], "confidence": confidence(abs(rel) - PROP_EDGE, 0.1),
-            "notes": f"Model projects {proj:.1f} (this season {mean_cur:.1f} in {n}, last {mean_prev:.1f}) vs {line:g}. Odds assumed -115.",
+        cands_key = c["espn"]
+        c.update(p_over=po, median=props.median(spread, c["stat"], p[c["stat"]]), name=p["name"], inputs=p["inputs"], game=e)
+        if cands_key not in seen:
+            rows.append(c)
+            seen.add(cands_key)
+    rows.sort(key=lambda c: c["p_over"])
+    out = []
+    for c in rows[: max(0, MAX_PROPS - posted)]:
+        label = PROP_LABELS[stat_id[c["stat"]]]
+        i = c["inputs"]
+        why = (
+            f"{i['tgt']:.1f} targets ({i['tgt_share']:.0%} of {i['team_att']:.0f} team passes)" if c["stat"] in ("rec", "rec_yds")
+            else f"{i['car']:.1f} carries ({i['car_share']:.0%} of {i['team_car']:.0f} team rushes)" if c["stat"] in ("rush_yds", "car")
+            else f"{i['att']:.0f} attempts"
+        )
+        out.append({
+            "sportsbook": "draftkings", "sport": "NFL", "event_description": f"{c['game']['away']['abbr']} @ {c['game']['home']['abbr']}", "stake": STAKE, "is_public": True,
+            "bet_type": "prop", "selection": f"{c['name']} {label} Under {c['line']:g}", "subject": c["name"],
+            "player_id": c["espn"], "prop_stat": stat_id[c["stat"]], "line": c["line"], "side": "under", "odds": -115, "potential_payout": payout(STAKE, -115),
+            "event_id": c["event"], "sport_path": "football/nfl", "event_start": c["game"]["start"].isoformat(), "confidence": confidence(props.UNDER_AT - c["p_over"], 0.08),
+            "notes": f"Model median {c['median']:.1f} vs {c['line']:g} ({c['p_over']:.0%} to go over), from {why}. Line from {c['source']}; odds assumed -115.",
         })
-    rows.sort(key=lambda x: -x["confidence"])
-    return rows[:MAX_PROPS]
+    return out
 
 
 def main():
@@ -320,7 +304,8 @@ def main():
             raise SystemExit("Set SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY and MODEL_USER_ID (or use --dry-run)")
         db = Supabase(url, key)
 
-    # Props on friends' open lines (needs the database).
+    # Props: DraftKings' lines and friends' logged lines (those need the database).
+    open_bets, posted = [], 0
     if db:
         since = (now - timedelta(days=7)).isoformat()
         open_bets = db.select(
@@ -332,15 +317,15 @@ def main():
             "bets",
             f"select=bet_type,event_id,event_start,event_description,legs&status=eq.pending&bet_type=eq.parlay&user_id=neq.{model_user}&club_id=is.null&placed_at=gte.{urllib.parse.quote(since)}",
         )
-        roster = read(raw, f"rosters/roster_{season}.parquet")
-        roster = roster.sort_values("week").drop_duplicates("gsis_id", keep="last")
-        lines_cur = game_lines(real_plays(pbp_cur), pbp_cur)
-        lines_prev = game_lines(real_plays(pbp_prev), pbp_prev)
-        pos_of = dict(zip(roster["gsis_id"], roster["position"]))
-        prev_roster = read(raw, f"rosters/roster_{season - 1}.parquet")
-        prev_pos = dict(zip(prev_roster["gsis_id"], prev_roster["position"])) if prev_roster is not None else {}
-        defense = defense_outlook(defense_vs_position(lines_cur, pos_of), defense_vs_position(lines_prev, prev_pos), int(pbp_cur["week"].max()))
-        picks += prop_picks(open_bets, roster, lines_cur, lines_prev, defense, now)
+        # Prop picks already posted for this week's games count toward the weekly cap.
+        week_events = {str(int(e)) for e in games[(games["season"] == season) & (games["week"] == week) & games["espn"].notna()]["espn"]}
+        posted = sum(1 for b in db.select("bets", f"select=event_id&user_id=eq.{model_user}&bet_type=eq.prop&placed_at=gte.{urllib.parse.quote((now - timedelta(days=8)).isoformat())}") if b["event_id"] in week_events)
+    try:
+        up = props.upcoming(raw, season, games)
+        if up and up["week"] == week:
+            picks += prop_picks(up, espn, open_bets, posted, now)
+    except Exception as e:  # the game picks still go out
+        print(f"Prop picks skipped: {e}")
 
     if db:
         # Never bet the same thing twice.
