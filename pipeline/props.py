@@ -54,6 +54,21 @@ PRIOR_EFF = 0.5  # last season's plays count half toward efficiency
 # Shrinkage: opportunities of league-average efficiency added to a player's own.
 K = {"catch": 40, "ypt": 60, "ypc": 80, "cmp": 150, "ypa": 200, "tdr": 400, "intr": 500}
 DEF_K = 6.0  # games of league-average defense added to a defense's own
+# Where and in what weather: measured on 2022-2024 (actual vs projected), tested
+# on 2025-2026. Players do a bit better at home and worse away (receiving and
+# passing about +/-2%, rushing about +/-1%); outdoor games at 45F or colder cut
+# receiving and passing (yards about -3 to -5%). Domes showed no difference.
+CONTEXT = True
+HOME = {"rec": 1.015, "rec_yds": 1.021, "rush_yds": 1.008, "car": 1.008, "pass_yds": 1.021, "cmp": 1.016, "att": 1.004, "pass_td": 1.032}
+COLD = {"rec": 0.985, "rec_yds": 0.966, "rush_yds": 1.0, "car": 1.0, "pass_yds": 0.953, "cmp": 0.965, "att": 0.985, "pass_td": 0.991}
+COLD_F = 45
+# Snap trend: a receiver whose snaps over his last two games are above his
+# season average is gaining a role before his targets catch up (and the
+# reverse). Target share moves by SNAP_TREND x the change in snap share, from
+# week 4. Fitted on 2022-2024; on 2025-2026 receiving error fell (receptions
+# -0.4%), but for carries it didn't hold up (rushing yards +0.5%), so carries
+# get none.
+SNAP_TREND = {"tshare": 0.6, "cshare": 0.0}
 
 STATS = ("tgt", "rec", "rec_yds", "car", "rush_yds", "att", "cmp", "pass_yds", "pass_td", "ints")
 
@@ -201,6 +216,13 @@ class PropModel:
         c_sh = cur.groupby("id").apply(lambda g: _weighted(g, week, cols), include_groups=False) if len(cur) else pd.DataFrame(columns=cols + ["n"])
         p_sh = prev.groupby("id")[cols].mean() if len(prev) else pd.DataFrame(columns=cols)
         c_eff = cur.groupby("id")[eff].sum() if len(cur) else pd.DataFrame(columns=eff)
+        # Snap share in the last two games against the season so far.
+        trend = {}
+        if week > 3 and "snap_pct" in cur.columns:
+            sp = cur.dropna(subset=["snap_pct"])
+            last2 = sp[sp["week"] >= week - 2].groupby("id")["snap_pct"].mean()
+            season = sp.groupby("id")["snap_pct"].mean()
+            trend = (last2 - season.reindex(last2.index)).dropna().to_dict()
         p_eff = prev.groupby("id")[eff].sum() if len(prev) else pd.DataFrame(columns=eff)
         ids = set(c_sh.index) | set(p_sh.index)
         last = pd.concat([prev, cur]).sort_values(["season", "week"]).groupby("id").last()
@@ -226,7 +248,9 @@ class PropModel:
 
             rows.append({
                 "id": pid, "pos": pos, "team": info["posteam"],
-                "tshare": sh["tshare"], "cshare": sh["cshare"], "ashare": sh["ashare"], "games": n,
+                "tshare": sh["tshare"] * min(1.6, max(0.6, 1 + SNAP_TREND["tshare"] * trend.get(pid, 0.0))),
+                "cshare": sh["cshare"] * min(1.6, max(0.6, 1 + SNAP_TREND["cshare"] * trend.get(pid, 0.0))),
+                "ashare": sh["ashare"], "games": n, "snap_trend": trend.get(pid, 0.0),
                 "catch": rate(e["rec"], e["tgt"], lg["catch"].get(pos, 0.65), K["catch"]),
                 "ypt": rate(e["rec_yds"], e["tgt"], lg["ypt"].get(pos, 7.5), K["ypt"]),
                 "ypc": rate(e["rush_yds"], e["car"], lg["ypc"].get(pos, 4.2), K["ypc"]),
@@ -286,7 +310,7 @@ class PropModel:
                     rush_yds = c * r["ypc"] * f.get("ypc", 1.0)
                     a = r["ashare"] * att if r["pos"] == "QB" else 0.0
                     qb = d.get("QB", {})
-                    out.append({
+                    row = {
                         "id": pid, "week": week, "team": team, "opp": opp, "pos": r["pos"],
                         # The inputs, for showing why: this week's shares and the team's expected volume.
                         "tgt_share": r["tshare"] * ts / self.league["tgt_rate"] if tsum else 0.0, "car_share": r["cshare"] * cs if csum else 0.0,
@@ -296,7 +320,15 @@ class PropModel:
                         "pass_yds": a * r["ypa"] * qb.get("ypa", 1.0) * wind_f,
                         "pass_td": a * r["tdr"] * (implied / fit["pts0"]),
                         "ints": a * r["intr"],
-                    })
+                    }
+                    if CONTEXT:
+                        home = team == g["home_team"]
+                        indoor = str(g.get("roof") or "") in ("dome", "closed")
+                        temp = g.get("temp")
+                        cold = not indoor and pd.notna(temp) and temp <= COLD_F
+                        for st, h in HOME.items():
+                            row[st] *= (h if home else 2 - h) * (COLD[st] if cold else 1.0)
+                    out.append(row)
         return pd.DataFrame(out)
 
 
@@ -453,7 +485,7 @@ def upcoming(raw: Path, season: int, games: pd.DataFrame, spread: dict | None = 
     if not len(left):
         return None
     week = int(left["week"].min())
-    wk_games = left[left["week"] == week]
+    wk_games = with_weather(left[left["week"] == week].copy(), season, week)
 
     roster = read(raw, f"rosters/roster_{season}.parquet")
     roster = roster[roster["week"] == roster["week"].max()]
@@ -503,6 +535,35 @@ def upcoming(raw: Path, season: int, games: pd.DataFrame, spread: dict | None = 
         td_rows = []
     return {"season": season, "week": week, "report_week": report, "tds": td_rows, "under_at": UNDER_AT, "under_floor": UNDER_FLOOR, "props": rows, "_lines": lines,
             "_proj": {e: {st: float(proj.loc[g, st]) for st in PROP_STATS} | {"name": names.get(g), "team": proj.loc[g, "team"], "inputs": {k: float(proj.loc[g, k]) for k in ("tgt", "car", "att", "tgt_share", "car_share", "team_att", "team_car")}} for e, g in by_espn.items()}}
+
+
+def with_weather(wk_games: pd.DataFrame, season: int, week: int) -> pd.DataFrame:
+    """
+    Kickoff wind and temperature for outdoor games within the forecast's reach
+    (nflverse only fills them in after the games), so the wind and cold
+    adjustments apply to upcoming games too.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from picks import espn_week, kickoff_weather
+
+    try:
+        espn = espn_week(season, week)
+    except Exception:
+        return wk_games
+    now = datetime.now(timezone.utc)
+    for i, g in wk_games.iterrows():
+        e = espn.get(str(int(g["espn"]))) if pd.notna(g.get("espn")) else None
+        if not e:
+            continue
+        if e["indoor"]:
+            wk_games.loc[i, "roof"] = "dome"
+            continue
+        if pd.isna(g.get("wind")) and e["start"] - now <= timedelta(hours=72):
+            wind, temp = kickoff_weather(e["city"], e["start"])
+            if wind is not None:
+                wk_games.loc[i, "wind"], wk_games.loc[i, "temp"] = wind, temp
+    return wk_games
 
 
 ARCHIVE = "https://raw.githubusercontent.com/hbirk01/NFL-stats/data/props-lines"
