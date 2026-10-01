@@ -36,7 +36,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 import alerts  # noqa: E402
 import props  # noqa: E402
 from build import injury_map, read  # noqa: E402
-from model import GAMES_CSV, Params, Ratings, fit, live_offset, load, pbp_for, predict, run, team_games, week_starters  # noqa: E402
+from model import GAMES_CSV, Params, Ratings, build_qb_ratings, fit, live_offset, live_starters, load, pbp_for, predict, run, team_games  # noqa: E402
 
 STAKE = 10.0
 WINDOW = timedelta(hours=36)
@@ -157,7 +157,7 @@ def confidence(edge: float, step: float) -> int:
 def game_picks(week: int, games: pd.DataFrame, espn: dict, ratings: Ratings, p: Params, now: datetime, injuries: dict, offset: float = 0.0) -> list[dict]:
     """Spread and total picks; `offset` centers the model's totals on the market's (see model.total_offset)."""
     rows = []
-    at = ratings.at(week, week_starters(games))
+    at = ratings.at(week, live_starters(games, ratings.main_qb, injuries))
     for _, g in games.iterrows():
         e = espn.get(str(int(g["espn"]))) if pd.notna(g.get("espn")) else None
         if not e or e["state"] != "pre" or not (now < e["start"] <= now + WINDOW):
@@ -287,9 +287,10 @@ def main():
     pbp_cur, pbp_prev, pbp_prev2 = pbp_for(raw, season), pbp_for(raw, season - 1), pbp_for(raw, season - 2)
     tg_cur, tg_prev, tg_prev2 = team_games(pbp_cur), team_games(pbp_prev), team_games(pbp_prev2)
     # Calibrate on last season (as in the backtest), then rate this season.
-    p = fit(run(games, tg_prev, tg_prev2, season - 1, Params()), Params())
+    qbr = build_qb_ratings([pbp_prev2, pbp_prev, pbp_cur])
+    p = fit(run(games, tg_prev, tg_prev2, season - 1, Params(), qbr=qbr), Params())
     p = Params(**{**p.__dict__, "spread_edge": SPREAD_EDGE, "total_edge": TOTAL_EDGE})
-    ratings = Ratings(tg_cur, tg_prev)
+    ratings = Ratings(tg_cur, tg_prev, qbr)
 
     upcoming = games[(games["season"] == season) & (games["game_type"] == "REG") & games["result"].isna()]
     injuries = injury_map(read(raw, f"injuries/injuries_{season}.parquet"))
@@ -299,7 +300,7 @@ def main():
         return
     espn = espn_week(season, week)
     wk_games = upcoming[upcoming["week"] == week]
-    offset = live_offset(games, tg_cur, tg_prev, tg_prev2, season, p, week)
+    offset = live_offset(games, tg_cur, tg_prev, tg_prev2, season, p, week, qbr)
     picks = game_picks(week, wk_games, espn, ratings, p, now, injuries, offset)
 
     db = None
