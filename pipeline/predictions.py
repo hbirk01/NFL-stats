@@ -6,13 +6,14 @@ Written by build.py as model.json.
 
 from __future__ import annotations
 
+import os
 from datetime import datetime, timedelta
 
 import pandas as pd
 
 from build import injury_map, read
-from model import GAMES_CSV, Params, Ratings, fit, load, pbp_for, predict, run, team_games, win_prob
-from picks import espn_week, kickoff_weather
+from model import GAMES_CSV, Params, Ratings, fit, load, pbp_for, predict, run, summarize, team_games, win_prob
+from picks import SPREAD_EDGE, TOTAL_EDGE, espn_week, kickoff_weather
 
 WEATHER_WITHIN = timedelta(hours=72)  # Open-Meteo's forecast reach, roughly
 
@@ -22,8 +23,8 @@ def predictions(raw, season: int, now: datetime, weeks_ahead: int = 2) -> dict |
     pbp_cur, pbp_prev, pbp_prev2 = pbp_for(raw, season), pbp_for(raw, season - 1), pbp_for(raw, season - 2)
     if games is None or pbp_cur is None or pbp_prev is None or pbp_prev2 is None:
         return None
-    tg_cur, tg_prev = team_games(pbp_cur), team_games(pbp_prev)
-    p = fit(run(games, tg_prev, team_games(pbp_prev2), season - 1, Params()), Params())
+    tg_cur, tg_prev, tg_prev2 = team_games(pbp_cur), team_games(pbp_prev), team_games(pbp_prev2)
+    p = fit(run(games, tg_prev, tg_prev2, season - 1, Params()), Params())
     ratings = Ratings(tg_cur, tg_prev)
     injuries = injury_map(read(raw, f"injuries/injuries_{season}.parquet"))
 
@@ -75,4 +76,30 @@ def predictions(raw, season: int, now: datetime, weeks_ahead: int = 2) -> dict |
                 "indoor": indoor,
                 "qb_out": qb_out,
             })
-    return {"generated": now.isoformat(timespec="seconds"), "season": season, "games": out}
+    return {
+        "generated": now.isoformat(timespec="seconds"),
+        "season": season,
+        # The Model account's profile, so the app can find its picks (set in the workflow).
+        "model_user": os.environ.get("MODEL_USER_ID") or None,
+        "replay": replay(games, tg_cur, tg_prev, tg_prev2, season, p),
+        "games": out,
+    }
+
+
+def replay(games, tg_cur, tg_prev, tg_prev2, season: int, p: Params) -> dict:
+    """
+    What the live rules (4+ point edges, spreads and totals, no moneylines) would
+    have done at the closing lines: this season so far, which the model hadn't
+    seen when it was calibrated, and last season, which it was calibrated on.
+    """
+    live = Params(**{**p.__dict__, "spread_edge": SPREAD_EDGE, "total_edge": TOTAL_EDGE, "ml_edge": 1.0})
+
+    def record(df, label):
+        s = summarize(df, label)
+        return {k: s[k] for k in ("label", "games", "spread", "total", "all") if k in s}
+
+    out = {"last": record(run(games, tg_prev, tg_prev2, season - 1, live), f"{season - 1} season")}
+    cur = run(games, tg_cur, tg_prev, season, live)
+    if len(cur):
+        out["this"] = record(cur, f"{season} so far")
+    return out
