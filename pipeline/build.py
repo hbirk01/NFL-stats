@@ -767,7 +767,11 @@ def main():
     try:
         import teams as team_pages
 
-        write(out / "leaders.json", {"season": season, "week": week, "positions": team_pages.leaders(adv, index)})
+        write(out / "leaders.json", {
+            "season": season, "week": week, "positions": team_pages.leaders(adv, index),
+            # Each position's metrics: key, label, and whether lower is better (null: neither).
+            "metrics": {pos: [{"k": k, "label": label, "lower": lower} for k, label, lower in ms] for pos, ms in METRICS.items()},
+        })
         depth = read(raw, f"depth_charts/depth_charts_{season}.parquet")
         write(out / "teams.json", team_pages.teams(pbp, prev_pbp, schedule, season, week, roster_all, injuries, depth))
     except Exception as e:  # noqa: BLE001
