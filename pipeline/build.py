@@ -763,6 +763,15 @@ def main():
 
     index.sort(key=lambda e: -((e["s"] or {}).get("fp_ppr") or 0))
     write(out / "index.json", index)
+    # League pages: leaderboards and team hubs. Never fail the build.
+    try:
+        import teams as team_pages
+
+        write(out / "leaders.json", {"season": season, "week": week, "positions": team_pages.leaders(adv, index)})
+        depth = read(raw, f"depth_charts/depth_charts_{season}.parquet")
+        write(out / "teams.json", team_pages.teams(pbp, prev_pbp, schedule, season, week, roster_all, injuries, depth))
+    except Exception as e:  # noqa: BLE001
+        print(f"  teams/leaders skipped: {e}")
     write(out / "defense.json", defense)
     # Every team's regular season, week by week (byes are the missing weeks).
     team_weeks = {}
