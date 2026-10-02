@@ -469,6 +469,18 @@ def median(spread: dict, stat: str, proj: float) -> float:
 
 # ── This week ────────────────────────────────────────────────────────────────
 
+def slot_of_schedule(weekday: str, gametime: str) -> str:
+    """The slot of the NFL week from nflverse's US Eastern day and kickoff ("Sunday", "16:25"); see picks.SLOTS."""
+    hour = int(str(gametime or "13:00").split(":")[0])
+    if weekday == "Thursday":
+        return "tnf"
+    if weekday == "Monday":
+        return "mnf"
+    if weekday == "Sunday":
+        return "snf" if hour >= 19 else "late" if hour >= 15 else "early"
+    return "other"
+
+
 def upcoming(raw: Path, season: int, games: pd.DataFrame, spread: dict | None = None) -> dict | None:
     """
     The next week's DraftKings prop lines with the model's projection, median
@@ -503,6 +515,7 @@ def upcoming(raw: Path, season: int, games: pd.DataFrame, spread: dict | None = 
     # A passing line means the book expects him to start.
     starters = {espn_to[x["athlete"]] for x in lines if x["stat"] in ("pass_yds", "att") and x["athlete"] in espn_to}
     proj = model.project(week, wk_games, team_of, starters).set_index("id")
+    slot_by_event = {str(int(g["espn"])): slot_of_schedule(g.get("weekday"), g.get("gametime")) for _, g in wk_games.iterrows() if pd.notna(g.get("espn"))}
     rows = []
     for x in lines:
         g = espn_to.get(x["athlete"])
@@ -512,7 +525,7 @@ def upcoming(raw: Path, season: int, games: pd.DataFrame, spread: dict | None = 
         mean = float(r[x["stat"]])
         po = p_over(spread, x["stat"], mean, x["line"])
         rows.append({
-            "espn": x["athlete"], "id": g, "name": names.get(g), "team": r["team"], "opp": r["opp"], "pos": r["pos"], "event": x["event"],
+            "espn": x["athlete"], "id": g, "name": names.get(g), "team": r["team"], "opp": r["opp"], "pos": r["pos"], "event": x["event"], "slot": slot_by_event.get(x["event"]),
             "stat": x["stat"], "line": x["line"], "open": x["open"],
             "proj": round(mean, 1), "median": round(median(spread, x["stat"], mean), 1), "p_over": None if po is None else round(po, 3),
             "inputs": {

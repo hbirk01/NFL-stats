@@ -14,7 +14,8 @@ Each run (see .github/workflows/model.yml):
   5. Props: DraftKings' player lines and the props friends logged, against
      the prop model (pipeline/props.py). Unders only, where it gives the over
      a 25-42% chance, in a range whose unders have won 55%+ this season; most
-     confident first, one per player, at most 8 a week.
+     confident first, one per player, by slot: one each for Thursday, Sunday
+     and Monday night, three each for Sunday early and late (one per game).
 Flat 1-unit ($10) stakes; the reasoning goes in each bet's notes.
 
   python pipeline/picks.py --dry-run          # print, don't post
@@ -24,6 +25,7 @@ Flat 1-unit ($10) stakes; the reasoning goes in each bet's notes.
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import json
 import math
 import os
@@ -31,6 +33,7 @@ import sys
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 import pandas as pd
@@ -45,7 +48,25 @@ STAKE = 10.0
 WINDOW = timedelta(hours=36)
 SPREAD_EDGE = 4.0
 TOTAL_EDGE = 4.0
-MAX_PROPS = 8  # prop picks a week
+# Prop picks per slot of the week: one for each prime-time game, three each for
+# Sunday's early and late windows (one per game there), one for any other day
+# (late-season Saturdays, holidays). Times in US Eastern.
+SLOTS = {"tnf": 1, "early": 3, "late": 3, "snf": 1, "mnf": 1, "other": 1}
+SLOT_NAME = {"tnf": "Thursday night", "early": "Sunday early", "late": "Sunday late", "snf": "Sunday night", "mnf": "Monday night", "other": "the extra games"}
+ONE_PER_GAME = {"early", "late"}
+
+
+def slot_of(start: datetime) -> str:
+    """Which slot of the NFL week a kickoff falls in."""
+    et = start.astimezone(ZoneInfo("America/New_York"))
+    day = et.weekday()  # Monday = 0
+    if day == 3:
+        return "tnf"
+    if day == 0:
+        return "mnf"
+    if day == 6:
+        return "snf" if et.hour >= 19 else "late" if et.hour >= 15 else "early"
+    return "other"
 ESPN = "https://site.api.espn.com/apis/site/v2/sports/football/nfl"
 
 # Prop stat id -> per-game column from build.game_lines.
@@ -216,15 +237,16 @@ def game_picks(week: int, games: pd.DataFrame, espn: dict, ratings: Ratings, p: 
 PROPS_JSON = "https://raw.githubusercontent.com/hbirk01/NFL-stats/data/props.json"
 
 
-def prop_picks(up: dict, espn: dict, open_bets: list, posted: int, now: datetime, table: list | None = None) -> list[dict]:
+def prop_picks(up: dict, espn: dict, open_bets: list, posted: list[str], now: datetime, table: list | None = None) -> list[dict]:
     """
     Player prop unders from the prop model (pipeline/props.py): DraftKings'
     lines, plus lines friends logged. Only where the model gives the over
     between UNDER_FLOOR and UNDER_AT (its overs didn't win in testing, and a
     far-off line usually means news it doesn't have), games within the window,
-    one per player, at most MAX_PROPS a week counting ones already posted.
-    The most confident first: the range whose unders have won most so far
-    (props.confidence_table, published with props.json).
+    one per player. The most confident first (the range whose unders have won
+    most so far: props.confidence_table, published with props.json), filling
+    each slot of the week (SLOTS) up to its quota; `posted` is the event ids of
+    this week's prop picks already made, which count toward their slots.
     """
     stat_id = {v: k for k, v in PROP_COLS.items()}
     proj = up.get("_proj", {})
@@ -253,11 +275,24 @@ def prop_picks(up: dict, espn: dict, open_bets: list, posted: int, now: datetime
         if cands_key not in seen:
             rows.append(c)
             seen.add(cands_key)
-    # Only what has won enough, most confident first.
+    # Only what has won enough, most confident first, filling each slot of the week.
     rows = [c for c in rows if c["conf"] >= MIN_CONFIDENCE]
     rows.sort(key=lambda c: (-c["conf"], c["p_over"]))
+    per_slot, per_game = Counter(), Counter(posted)
+    for event in posted:
+        if event in espn:
+            per_slot[slot_of(espn[event]["start"])] += 1
+    chosen = []
+    for c in rows:
+        slot = slot_of(c["game"]["start"])
+        if per_slot[slot] >= SLOTS[slot] or (slot in ONE_PER_GAME and per_game[c["event"]] >= 1):
+            continue
+        per_slot[slot] += 1
+        per_game[c["event"]] += 1
+        chosen.append({**c, "slot": slot})
+    rows = chosen
     out = []
-    for c in rows[: max(0, MAX_PROPS - posted)]:
+    for c in rows:
         label = PROP_LABELS[stat_id[c["stat"]]]
         i = c["inputs"]
         why = (
@@ -270,7 +305,7 @@ def prop_picks(up: dict, espn: dict, open_bets: list, posted: int, now: datetime
             "bet_type": "prop", "selection": f"{c['name']} {label} Under {c['line']:g}", "subject": c["name"],
             "player_id": c["espn"], "prop_stat": stat_id[c["stat"]], "line": c["line"], "side": "under", "odds": -115, "potential_payout": payout(STAKE, -115),
             "event_id": c["event"], "sport_path": "football/nfl", "event_start": c["game"]["start"].isoformat(), "confidence": max(1, min(5, round((c["conf"] - props.BREAK_EVEN) / 0.015) + 2)),
-            "notes": f"Model median {c['median']:.1f} vs {c['line']:g} ({c['p_over']:.0%} to go over), from {why}. Unders like this have won {c['conf']:.0%} so far. Line from {c['source']}; odds assumed -115.",
+            "notes": f"{SLOT_NAME[c['slot']]} pick. Model median {c['median']:.1f} vs {c['line']:g} ({c['p_over']:.0%} to go over), from {why}. Unders like this have won {c['conf']:.0%} so far. Line from {c['source']}; odds assumed -115.",
         })
     return out
 
@@ -326,7 +361,7 @@ def main():
         db = Supabase(url, key)
 
     # Props: DraftKings' lines and friends' logged lines (those need the database).
-    open_bets, posted = [], 0
+    open_bets, posted = [], []
     if db:
         since = (now - timedelta(days=7)).isoformat()
         open_bets = db.select(
@@ -340,7 +375,7 @@ def main():
         )
         # Prop picks already posted for this week's games count toward the weekly cap.
         week_events = {str(int(e)) for e in games[(games["season"] == season) & (games["week"] == week) & games["espn"].notna()]["espn"]}
-        posted = sum(1 for b in db.select("bets", f"select=event_id&user_id=eq.{model_user}&bet_type=eq.prop&placed_at=gte.{urllib.parse.quote((now - timedelta(days=8)).isoformat())}") if b["event_id"] in week_events)
+        posted = [b["event_id"] for b in db.select("bets", f"select=event_id&user_id=eq.{model_user}&bet_type=eq.prop&placed_at=gte.{urllib.parse.quote((now - timedelta(days=8)).isoformat())}") if b["event_id"] in week_events]
     try:
         up = props.upcoming(raw, season, games)
         if up and up["week"] == week:
