@@ -5,7 +5,8 @@ League-wide pages for BetTracker:
                 position (the sortable leaderboards)
   teams.json    each team: record, offense/defense EPA per play by week and
                 their league ranks, the model's power rating week by week,
-                starters from the depth chart, and the injury report
+                results against the closing spread and total, starters from
+                the depth chart, and the injury report
 
 Written by build.py.
 """
@@ -61,6 +62,35 @@ def _record(sched: pd.DataFrame, team: str) -> dict:
     return {"w": int(w), "l": int(l), "t": int(t), "pf": int(pf), "pa": int(pa)}
 
 
+def _vs_lines(x: pd.Series, team: str) -> dict:
+    """A finished game against the closing lines, from the team's side: its spread (- = favored), cover, over/under."""
+    if pd.isna(x.get("result")) or pd.isna(x.get("spread_line")):
+        return {}
+    home = x["home_team"] == team
+    # nflverse: spread_line > 0 means the home team was favored by that much; result = home - away.
+    line = float(-x["spread_line"] if home else x["spread_line"])
+    margin = float(x["result"] if home else -x["result"])
+    cover = margin + line
+    out = {"line": line, "ats": "W" if cover > 0 else "L" if cover < 0 else "P"}
+    if not pd.isna(x.get("total_line")):
+        total = float(x["home_score"] + x["away_score"])
+        out |= {"total_line": float(x["total_line"]), "ou": "O" if total > x["total_line"] else "U" if total < x["total_line"] else "P"}
+    return out
+
+
+def _trends(weekly: list[dict]) -> dict:
+    """Season records against the spread (overall, as favorite, as underdog) and on totals."""
+    def rec(rows, key, labels):
+        return {lab.lower(): sum(1 for r in rows if r.get(key) == lab) for lab in labels}
+    ats = [w for w in weekly if "ats" in w]
+    return {
+        "ats": rec(ats, "ats", "WLP"),
+        "fav": rec([w for w in ats if w["line"] < 0], "ats", "WLP"),
+        "dog": rec([w for w in ats if w["line"] > 0], "ats", "WLP"),
+        "ou": rec(weekly, "ou", "OUP"),
+    }
+
+
 def teams(pbp: pd.DataFrame, prev_pbp: pd.DataFrame | None, sched: pd.DataFrame, season: int, week: int,
           roster_all: pd.DataFrame, injuries: dict, depth: pd.DataFrame | None) -> dict:
     tg = team_games(pbp)
@@ -101,6 +131,7 @@ def teams(pbp: pd.DataFrame, prev_pbp: pd.DataFrame | None, sched: pd.DataFrame,
                 "pf": None if pd.isna(x["home_score"]) else int(x["home_score"] if home else x["away_score"]),
                 "pa": None if pd.isna(x["home_score"]) else int(x["away_score"] if home else x["home_score"]),
                 "off_epa": round(float(g["off_epa"]), 3), "def_epa": round(float(g["def_epa"]), 3),
+                **_vs_lines(x, t),
             })
         starters = {"offense": [], "defense": []}
         if snapshot is not None:
@@ -125,6 +156,6 @@ def teams(pbp: pd.DataFrame, prev_pbp: pd.DataFrame | None, sched: pd.DataFrame,
             "off_rank": int(off_rank[t]) if t in off_rank.index else None,
             "def_rank": int(def_rank[t]) if t in def_rank.index else None,
             "power": power[t], "power_rank": int(power_rank[t]) if t in power_rank.index else None,
-            "weekly": weekly, "starters": starters, "injuries": hurt,
+            "weekly": weekly, "trends": _trends(weekly), "starters": starters, "injuries": hurt,
         }
     return {"season": season, "week": week, "lg_epa": round(lg, 3), "teams": out}
