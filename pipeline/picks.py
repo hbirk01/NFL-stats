@@ -237,14 +237,22 @@ def game_picks(week: int, games: pd.DataFrame, espn: dict, ratings: Ratings, p: 
 PROPS_JSON = "https://raw.githubusercontent.com/hbirk01/NFL-stats/data/props.json"
 
 
+def moved(c: dict) -> str:
+    """" The line has moved down from 40.5 since it opened." (empty when it hasn't)."""
+    move = props.move_of(c["line"], c.get("open"))
+    return "" if move == "flat" else f" The line has moved {move} from {c['open']:g} since it opened."
+
+
 def prop_picks(up: dict, espn: dict, open_bets: list, posted: list[str], now: datetime, table: list | None = None) -> list[dict]:
     """
     Player prop unders from the prop model (pipeline/props.py): DraftKings'
     lines, plus lines friends logged. Only where the model gives the over
     between UNDER_FLOOR and UNDER_AT (its overs didn't win in testing, and a
     far-off line usually means news it doesn't have), games within the window,
-    one per player. The most confident first (the range whose unders have won
-    most so far: props.confidence_table, published with props.json), filling
+    one per player. Only where unders like it have won MIN_CONFIDENCE so far,
+    which in practice means DraftKings' line has moved since it opened
+    (props.confidence_table, published with props.json); the most confident
+    first, filling
     each slot of the week (SLOTS) up to its quota; `posted` is the event ids of
     this week's prop picks already made, which count toward their slots.
     """
@@ -252,7 +260,7 @@ def prop_picks(up: dict, espn: dict, open_bets: list, posted: list[str], now: da
     proj = up.get("_proj", {})
     cands = []
     for x in up["props"]:
-        cands.append({"espn": x["espn"], "stat": x["stat"], "line": x["line"], "event": x["event"], "source": "DraftKings"})
+        cands.append({"espn": x["espn"], "stat": x["stat"], "line": x["line"], "open": x.get("open"), "event": x["event"], "source": "DraftKings"})
     for b in open_bets:
         legs = [b] if b.get("bet_type") == "prop" else [leg for leg in (b.get("legs") or []) if leg.get("kind") == "prop"]
         for leg in legs:
@@ -270,7 +278,7 @@ def prop_picks(up: dict, espn: dict, open_bets: list, posted: list[str], now: da
         if po is None or not (props.UNDER_FLOOR < po <= props.UNDER_AT):
             continue
         cands_key = c["espn"]
-        conf = props.confidence_of(table, po)
+        conf = props.confidence_of(table, po, c["line"], c.get("open"))
         c.update(p_over=po, median=props.median(spread, c["stat"], p[c["stat"]]), name=p["name"], inputs=p["inputs"], game=e, conf=conf["rate"] if conf else props.BREAK_EVEN)
         if cands_key not in seen:
             rows.append(c)
@@ -305,7 +313,7 @@ def prop_picks(up: dict, espn: dict, open_bets: list, posted: list[str], now: da
             "bet_type": "prop", "selection": f"{c['name']} {label} Under {c['line']:g}", "subject": c["name"],
             "player_id": c["espn"], "prop_stat": stat_id[c["stat"]], "line": c["line"], "side": "under", "odds": -115, "potential_payout": payout(STAKE, -115),
             "event_id": c["event"], "sport_path": "football/nfl", "event_start": c["game"]["start"].isoformat(), "confidence": max(1, min(5, round((c["conf"] - props.BREAK_EVEN) / 0.015) + 2)),
-            "notes": f"{SLOT_NAME[c['slot']]} pick. Model median {c['median']:.1f} vs {c['line']:g} ({c['p_over']:.0%} to go over), from {why}. Unders like this have won {c['conf']:.0%} so far. Line from {c['source']}; odds assumed -115.",
+            "notes": f"{SLOT_NAME[c['slot']]} pick. Model median {c['median']:.1f} vs {c['line']:g} ({c['p_over']:.0%} to go over), from {why}.{moved(c)} Unders like this have won {c['conf']:.0%} so far. Line from {c['source']}; odds assumed -115.",
         })
     return out
 
