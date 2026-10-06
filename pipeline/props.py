@@ -44,7 +44,7 @@ import numpy as np
 import pandas as pd
 
 from build import game_lines, injury_map, read, real_plays
-from model import GAMES_CSV, load, pbp_for
+from model import GAMES_CSV, MIN_CONFIDENCE, load, pbp_for
 import proplines
 
 POSITIONS = ("QB", "RB", "WR", "TE")
@@ -586,8 +586,9 @@ def archive(out: Path, season: int, week: int, lines: list[dict], games: pd.Data
     """
     Keeps every week's DraftKings lines on the data branch (props-lines/), which
     is rebuilt from scratch each run: last run's files are carried over, this
-    week's are written fresh, and last week's are refreshed to their closing
-    numbers. Returns how many weeks are archived.
+    week's are merged with today's lines (DraftKings drops a game's lines at
+    kickoff, so games already started keep their last numbers), and last week's
+    are refreshed to their closing numbers. Returns how many weeks are archived.
     """
     import urllib.request
 
@@ -604,7 +605,11 @@ def archive(out: Path, season: int, week: int, lines: list[dict], games: pd.Data
                 (folder / name).write_bytes(r.read())
         except Exception as e:
             print(f"  props archive: couldn't carry {name}: {e}")
-    (folder / f"{season}-w{week}.json").write_text(json.dumps(lines, separators=(",", ":")))
+    current = folder / f"{season}-w{week}.json"
+    kept = json.loads(current.read_text()) if current.exists() else []
+    key = lambda x: (x["event"], x["athlete"], x["stat"])  # noqa: E731
+    fresh = {key(x) for x in lines}
+    current.write_text(json.dumps([x for x in kept if key(x) not in fresh] + lines, separators=(",", ":")))
     # Last week's closing numbers; and on the first run, every earlier week ESPN still has.
     for w in range(1, week):
         if w < week - 1 and (folder / f"{season}-w{w}.json").exists():
@@ -618,35 +623,48 @@ def archive(out: Path, season: int, week: int, lines: list[dict], games: pd.Data
     return len(names)
 
 
-# Confidence: how often the model's unders have actually won, by its chance of the
-# over (testing found no steady "further from the line = better" pattern, so it's
-# measured, not assumed). Recomputed from the archived lines every data run;
-# small samples lean toward break-even at -110.
-BUCKETS = [(0.0, 0.25), (0.25, 0.30), (0.30, 0.34), (0.34, 0.38), (0.38, 0.42), (0.42, 0.46), (0.46, 0.50)]
+# Confidence: how often the model's unders (UNDER_FLOOR < p_over <= UNDER_AT) have
+# actually won, by how DraftKings' line has moved since it opened. In 2026 weeks
+# 1-4 they won about 59% where the line had moved (down: the market agrees; up:
+# a better number for the under) and about 53%, break-even, where it never
+# moved. How far the model sits from the line made no steady difference: the
+# per-range rates it was ranked by before were noise. Recomputed from the
+# archived lines (closing vs opening) every data run; small samples lean toward
+# break-even at -110.
+MOVES = ("down", "up", "flat")
 BREAK_EVEN = 0.524
 PRIOR_N = 40
 
 
+def move_of(line: float, opened: float | None) -> str:
+    """How DraftKings' line has moved since it opened: down, up, or flat (no move, or no opening line known)."""
+    if opened is None or pd.isna(opened) or line == opened:
+        return "flat"
+    return "down" if line < opened else "up"
+
+
 def confidence_table(scored: pd.DataFrame) -> list[dict]:
-    """Per range of the over chance: unders won and lost so far, and the (shrunk) win rate."""
+    """The model's unders by line movement: won and lost so far, and the (shrunk) win rate."""
     s = scored.dropna(subset=["p_over"])
-    s = s[s["act"] != s["line"]]
+    s = s[(s["act"] != s["line"]) & (s["p_over"] > UNDER_FLOOR) & (s["p_over"] <= UNDER_AT)]
+    moves = [move_of(line, opened) for line, opened in zip(s["line"], s["open"] if "open" in s else [None] * len(s))]
     out = []
-    for lo, hi in BUCKETS:
-        g = s[(s["p_over"] > lo) & (s["p_over"] <= hi)]
+    for move in MOVES:
+        g = s[[m == move for m in moves]]
         won = int((g["act"] < g["line"]).sum())
         lost = len(g) - won
-        out.append({"lo": lo, "hi": hi, "won": won, "lost": lost, "rate": round((won + BREAK_EVEN * PRIOR_N) / (won + lost + PRIOR_N), 3)})
+        out.append({"move": move, "won": won, "lost": lost, "rate": round((won + BREAK_EVEN * PRIOR_N) / (won + lost + PRIOR_N), 3)})
     return out
 
 
-def confidence_of(table: list[dict] | None, p: float | None) -> dict | None:
-    """The record for an under at this chance of going over (None for overs)."""
-    if p is None or not table:
+def confidence_of(table: list[dict] | None, p: float | None, line: float, opened: float | None) -> dict | None:
+    """The record for an under like this one: in the model's range, with this line movement (None otherwise)."""
+    if p is None or not table or not (UNDER_FLOOR < p <= UNDER_AT):
         return None
+    move = move_of(line, opened)
     for b in table:
-        if b["lo"] < p <= b["hi"] or (b["lo"] == 0 and p == 0):
-            return {"rate": b["rate"], "won": b["won"], "lost": b["lost"]}
+        if b.get("move") == move:
+            return {"rate": b["rate"], "won": b["won"], "lost": b["lost"], "move": move}
     return None
 
 
@@ -658,7 +676,7 @@ def with_confidence(up: dict, raw: Path, season: int, games: pd.DataFrame, lines
     table = confidence_table(score_lines(walked, lines_dir, roster, spread))
     up["confidence"] = table
     for x in up["props"]:
-        x["confidence"] = confidence_of(table, x["p_over"])
+        x["confidence"] = confidence_of(table, x["p_over"], x["line"], x.get("open"))
 
 
 def score_lines(walked: pd.DataFrame, lines_dir: Path, roster: pd.DataFrame, spread: dict) -> pd.DataFrame:
@@ -673,7 +691,7 @@ def score_lines(walked: pd.DataFrame, lines_dir: Path, roster: pd.DataFrame, spr
             if g not in w.index or x["stat"] not in PROP_STATS:
                 continue
             r = w.loc[g]
-            rows.append({"season": season, "week": week, "stat": x["stat"], "line": x["line"], "proj": r[x["stat"]], "act": r[f"{x['stat']}_act"],
+            rows.append({"season": season, "week": week, "stat": x["stat"], "line": x["line"], "open": x.get("open"), "proj": r[x["stat"]], "act": r[f"{x['stat']}_act"],
                          "p_over": p_over(spread, x["stat"], r[x["stat"]], x["line"])})
     return pd.DataFrame(rows)
 
@@ -705,6 +723,9 @@ def main():
         for week, g in unders.groupby("week"):
             w = int((g["act"] < g["line"]).sum())
             print(f"  week {week}: {w}-{len(g) - w}")
+        print("by line movement (the confidence table):")
+        for b in confidence_table(L):
+            print(f"  {b['move']:5} {b['won']}-{b['lost']}  rate {b['rate']:.1%}{'  (bet)' if b['rate'] >= MIN_CONFIDENCE else ''}")
 
 
 if __name__ == "__main__":
