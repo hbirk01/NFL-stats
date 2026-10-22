@@ -131,12 +131,16 @@ def team_ratings(box: pd.DataFrame) -> dict:
     return out
 
 
-def hit_rates(log: pd.DataFrame, stat: str, line: float) -> dict:
-    """How often the player went over `line`: last 5, last 10, all this season (games he played)."""
+def hit_rates(log: pd.DataFrame, stat: str, line: float, before: pd.DataFrame | None = None) -> dict:
+    """
+    How often the player went over `line` in games he played: his last 5 and 10
+    (reaching back into `before`, last season, early in a season) and all of `log`.
+    """
     v = log[stat].to_numpy()
+    recent = np.concatenate([before[stat].to_numpy(), v]) if before is not None else v
     def rate(x):
         return {"over": int((x > line).sum()), "n": int(len(x))}
-    return {"l5": rate(v[-5:]), "l10": rate(v[-10:]), "all": rate(v)}
+    return {"l5": rate(recent[-5:]), "l10": rate(recent[-10:]), "all": rate(v)}
 
 
 def build(out: Path, day: str, raw: Path | None = None) -> None:
@@ -202,7 +206,7 @@ def build(out: Path, day: str, raw: Path | None = None) -> None:
             "opp": g.get("home") if g.get("away") == info["team"] else g.get("away"), "start": g.get("start"),
             "avg": round(float(log_c[l["stat"]].mean()), 1) if len(log_c) else None,
             "avg_last": round(float(log_p[l["stat"]].mean()), 1) if len(log_p) else None,
-            "hits": hit_rates(log_c, l["stat"], l["line"]), "hits_last": hit_rates(log_p, l["stat"], l["line"]),
+            "hits": hit_rates(log_c, l["stat"], l["line"], before=log_p), "hits_last": hit_rates(log_p, l["stat"], l["line"]),
         })
     (nba / "props.json").write_text(json.dumps({"date": day, "season": season, "props": props}, separators=(",", ":")))
     (nba / "meta.json").write_text(json.dumps({
