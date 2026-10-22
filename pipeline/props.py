@@ -625,22 +625,27 @@ def archive(out: Path, season: int, week: int, lines: list[dict], games: pd.Data
 
 # Confidence: how often the model's unders (UNDER_FLOOR < p_over <= UNDER_AT) have
 # actually won, by how DraftKings' line has moved since it opened. In 2026 weeks
-# 1-4 they won about 59% where the line had moved (down: the market agrees; up:
-# a better number for the under) and about 53%, break-even, where it never
-# moved. How far the model sits from the line made no steady difference: the
-# per-range rates it was ranked by before were noise. Recomputed from the
-# archived lines (closing vs opening) every data run; small samples lean toward
-# break-even at -110.
+# 1-6 they won about 62% where the line moved down (the market agrees) and 60%
+# where it rose 5%+ (a better number for the under), but only 49% where it crept
+# up by less (drift, not information) and 53%, break-even, where it never moved;
+# both halves of the season agreed. So a rise under UP_MIN counts as flat. How
+# far the model sits from the line made no steady difference, and outside the
+# band movement doesn't help (moved-down unders at 42-50% went 47%).
+# Recomputed from the archived lines (closing vs opening) every data run; small
+# samples lean toward break-even at -110.
 MOVES = ("down", "up", "flat")
+UP_MIN = 0.05
 BREAK_EVEN = 0.524
 PRIOR_N = 40
 
 
 def move_of(line: float, opened: float | None) -> str:
-    """How DraftKings' line has moved since it opened: down, up, or flat (no move, or no opening line known)."""
+    """How DraftKings' line has moved since it opened: down, up (by UP_MIN of the opening line or more), or flat."""
     if opened is None or pd.isna(opened) or line == opened:
         return "flat"
-    return "down" if line < opened else "up"
+    if line < opened:
+        return "down"
+    return "up" if opened > 0 and (line - opened) / opened >= UP_MIN else "flat"
 
 
 def confidence_table(scored: pd.DataFrame) -> list[dict]:
