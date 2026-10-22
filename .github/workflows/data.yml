@@ -14,8 +14,9 @@ permissions:
   contents: write
 
 concurrency:
+  # Shared with the NBA publish: both rewrite the one-commit data branch.
   group: publish-data
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -33,6 +34,10 @@ jobs:
       - run: python pipeline/build.py --out dist
         env:
           MODEL_USER_ID: ${{ secrets.MODEL_USER_ID }}
+      - name: Keep the NBA files (Publish NBA data builds those)
+        run: |
+          git clone -q --depth 1 --branch data "https://github.com/${{ github.repository }}.git" prev && cp -r prev/nba dist/nba || true
+          rm -rf prev
       - name: Publish to the data branch
         run: |
           cd dist

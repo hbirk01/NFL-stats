@@ -1,0 +1,48 @@
+# Rebuilds the NBA stats BetTracker reads (pipeline/nba_build.py: hoopR box
+# scores, ESPN games and DraftKings lines) into nba/ on the `data` branch, next
+# to the NFL files, which it keeps. Several runs a day so the prop lines are
+# archived before every slate tips off (ESPN drops a game's lines at tip-off).
+name: Publish NBA data
+
+on:
+  schedule:
+    # hoopR refreshes overnight; then before afternoon, early and late tip-offs (UTC).
+    - cron: "0 15 * * *"
+    - cron: "0 21 * * *"
+    - cron: "45 22 * * *"
+    - cron: "30 0 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  # Shared with the NFL publish: both rewrite the one-commit data branch.
+  group: publish-data
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pipeline/requirements.txt
+      - run: pip install -r pipeline/requirements.txt
+      - name: Start from the published data (keeps the NFL files and the NBA lines archive)
+        run: |
+          git clone -q --depth 1 --branch data "https://github.com/${{ github.repository }}.git" dist || mkdir dist
+          rm -rf dist/.git
+      - run: python pipeline/nba_build.py --out dist
+      - name: Publish to the data branch
+        run: |
+          cd dist
+          git init -q -b data
+          git config user.name "github-actions[bot]"
+          git config user.email "41898+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -qm "Data $(date -u +%Y-%m-%dT%H:%MZ)"
+          git push -q --force "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" data
